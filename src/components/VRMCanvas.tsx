@@ -6,6 +6,7 @@ import { retargetAnimationFromUrl } from 'vrm-mixamo-retarget';
 import { VRM_CONFIG, AI_PROFILE, THEME_COLORS, getWaitingAnimationCandidateUrls } from '../constants';
 import { lipSyncManager } from '../lib/lipSync';
 import { fetchVRMWithCache } from '../lib/vrmCache';
+import { AvatarEmotion } from '../lib/emotionDetector';
 import { Sparkles, AlertTriangle } from 'lucide-react';
 
 interface VRMCanvasProps {
@@ -16,6 +17,7 @@ interface VRMCanvasProps {
   isPainSoundPlaying?: boolean;
   modelFileName?: string;
   lastUserMessageAt?: number;
+  emotion?: AvatarEmotion;
 }
 
 export const VRMCanvas: React.FC<VRMCanvasProps> = ({
@@ -26,9 +28,16 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
   isPainSoundPlaying = false,
   modelFileName = 'hana_v1.0_vrm1.vrm',
   lastUserMessageAt = 0,
+  emotion = 'neutral',
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Store emotion state in ref to avoid recreating Three.js scene while updating expressions smoothly
+  const emotionRef = useRef<AvatarEmotion>(emotion);
+  useEffect(() => {
+    emotionRef.current = emotion || 'neutral';
+  }, [emotion]);
 
   // Download & Loading state
   const [downloadProgress, setDownloadProgress] = useState<number | null>(null);
@@ -137,15 +146,22 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
     adjustCameraFraming();
 
-    // 3. Renderer Setup
+    // 3. Renderer Setup with hardware-adaptive pixel ratio to eliminate GPU lag
+    const isLowPowerDevice =
+      typeof navigator !== 'undefined' &&
+      ((navigator.hardwareConcurrency || 4) <= 4 || /Mobi|Android|iPhone/i.test(navigator.userAgent));
+    const targetPixelRatio = isLowPowerDevice
+      ? Math.min(window.devicePixelRatio || 1, 1.25)
+      : Math.min(window.devicePixelRatio || 1, 1.6);
+
     const renderer = new THREE.WebGLRenderer({
       canvas,
       alpha: true,
-      antialias: true,
+      antialias: !isLowPowerDevice,
       powerPreference: 'high-performance',
     });
     renderer.setSize(width, height);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setPixelRatio(targetPixelRatio);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.0;
@@ -409,6 +425,9 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
     let currentRelaxed = 0.25;
     let currentHappy = 0.0;
     let currentAngry = 0.0;
+    let currentSad = 0.0;
+    let currentSurprised = 0.0;
+    let currentMouthOpen = 0.0;
 
     // ----------------------------------------------------
     // Waiting Animations (60s Inactivity Random Selector & Immediate Interrupt)
@@ -646,8 +665,23 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
       setTimeout(handleFallComplete, fallDuration + 150);
     };
 
-    // 7. Render & Animation Loop
+    // Pre-allocated scratch objects to prevent per-frame garbage collection
+    const scratchHeadWorldPos = new THREE.Vector3();
+
+    // 7. Render & Animation Loop with Tab Visibility Pausing
+    let isTabVisible = typeof document === 'undefined' ? true : !document.hidden;
+    const handleVisibilityChange = () => {
+      isTabVisible = typeof document === 'undefined' ? true : !document.hidden;
+      if (isTabVisible && !isDisposed) {
+        lastAnimTime = performance.now();
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = requestAnimationFrame(animate);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     const animate = () => {
+      if (!isTabVisible || isDisposed) return;
       animationFrameId = requestAnimationFrame(animate);
 
       const now = performance.now();
@@ -803,24 +837,74 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
           }
         }
 
-        // Pain sound temporary angry/annoyed expression mood animation (also sustained while falling)
+        // Sentiment & Emotion blending based on overall AI output sentiment
         const isPainActive = isPainSoundPlayingRef.current || isFalling;
-        const targetAngry = isPainActive ? 0.95 : 0.0;
+        const currentActiveEmotion = emotionRef.current || 'neutral';
+
+        let targetAngry = 0.0;
+        let targetRelaxed = isSmiling ? 0.35 : 0.25;
+        let targetHappy = isSmiling ? 0.25 : 0.0;
+        let targetSad = 0.0;
+        let targetSurprised = 0.0;
+        let targetMouthOpen = 0.0;
+
+        switch (currentActiveEmotion) {
+          case 'happy':
+            // "happy" (just need to show mouth slightly open with eyes relaxed)
+            targetHappy = 0.85;
+            targetRelaxed = 0.45;
+            targetMouthOpen = 0.16;
+            break;
+          case 'smug':
+            // "smug" (relaxed expression)
+            targetRelaxed = 0.85;
+            targetHappy = 0.22;
+            break;
+          case 'sad':
+            // "sad"
+            targetSad = 0.8;
+            targetRelaxed = 0.0;
+            targetHappy = 0.0;
+            break;
+          case 'angry':
+            // "angry"
+            targetAngry = 0.85;
+            targetRelaxed = 0.0;
+            targetHappy = 0.0;
+            break;
+          case 'surprised':
+            // "surprised"
+            targetSurprised = 0.85;
+            targetRelaxed = 0.2;
+            targetMouthOpen = 0.18;
+            break;
+          case 'neutral':
+          default:
+            // "neutral" (the current default usual face emotion)
+            break;
+        }
+
+        // Pain sound or physical fall overrides anger
+        if (isPainActive) {
+          targetAngry = 0.95;
+          targetRelaxed = 0.0;
+          targetHappy = 0.0;
+        }
+
         currentAngry = THREE.MathUtils.lerp(
           currentAngry,
           targetAngry,
           delta * (isPainActive ? 12.0 : 4.5)
         );
-
-        const targetRelaxed = isPainActive ? 0.0 : (isSmiling ? 0.35 : 0.25);
-        const targetHappy = isPainActive ? 0.0 : (isSmiling ? 0.25 : 0.0);
-
         currentRelaxed = THREE.MathUtils.lerp(currentRelaxed, targetRelaxed, delta * 3.5);
         currentHappy = THREE.MathUtils.lerp(currentHappy, targetHappy, delta * 3.5);
+        currentSad = THREE.MathUtils.lerp(currentSad, targetSad, delta * 3.5);
+        currentSurprised = THREE.MathUtils.lerp(currentSurprised, targetSurprised, delta * 4.5);
+        currentMouthOpen = THREE.MathUtils.lerp(currentMouthOpen, targetMouthOpen, delta * 4.0);
 
         // Expression Manager Updates
         if (vrm.expressionManager) {
-          vrm.expressionManager.setValue('aa', visemes.aa);
+          vrm.expressionManager.setValue('aa', Math.min(1.0, visemes.aa + currentMouthOpen));
           vrm.expressionManager.setValue('ih', visemes.ih);
           vrm.expressionManager.setValue('ou', visemes.ou);
           vrm.expressionManager.setValue('ee', visemes.ee);
@@ -830,8 +914,8 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
           const moodSuppression = Math.max(0, 1.0 - currentAngry * 1.2);
           vrm.expressionManager.setValue('relaxed', currentRelaxed * moodSuppression);
           vrm.expressionManager.setValue('happy', Math.min(1.0, currentHappy + hitExpressionHappy) * moodSuppression);
-          vrm.expressionManager.setValue('surprised', Math.min(1.0, hitExpressionSurprised));
-          vrm.expressionManager.setValue('sad', 0);
+          vrm.expressionManager.setValue('surprised', Math.min(1.0, currentSurprised + hitExpressionSurprised));
+          vrm.expressionManager.setValue('sad', currentSad);
           vrm.expressionManager.setValue('angry', currentAngry);
         }
 
@@ -871,11 +955,10 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
         const isWaitPlaying = Boolean(activeWaitActionRef.current);
 
         if (!isFalling && !isWaitPlaying && headNode && cameraRef.current) {
-          const headWorldPos = new THREE.Vector3();
-          headNode.getWorldPosition(headWorldPos);
-          headWorldPos.y += 0.055;
+          headNode.getWorldPosition(scratchHeadWorldPos);
+          scratchHeadWorldPos.y += 0.055;
 
-          const headScreenPos = headWorldPos.project(cameraRef.current);
+          const headScreenPos = scratchHeadWorldPos.project(cameraRef.current);
 
           const deltaX = mouseRef.current.x - headScreenPos.x;
           const deltaY = mouseRef.current.y - headScreenPos.y;
@@ -1059,6 +1142,7 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
       if (waitFinishTimeoutId) clearTimeout(waitFinishTimeoutId);
       clickTimestampsRef.current = [];
       cancelAnimationFrame(animationFrameId);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('resize', handleResize);
       window.removeEventListener('pointermove', handlePointerMove);
       container.removeEventListener('pointerdown', handlePointerDown);

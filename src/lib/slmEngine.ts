@@ -4,6 +4,7 @@ import { TOKEN_CONFIG, OLLAMA_CONFIG } from '../constants';
 import { getPersonaPrompt, cleanModelResponse } from './prompts';
 import { streamOllama } from './ollama';
 import { loadCustomOllamaUrl, loadStoredApiKey, loadStoredProviderModel } from './storage';
+import { executeTool, extractToolCalls, getToolCallingSystemPrompt } from '../tools';
 
 // Configure Transformers.js for browser environment
 if (typeof window !== 'undefined') {
@@ -16,6 +17,7 @@ if (typeof window !== 'undefined') {
 let activeGenerator: any = null;
 let activeModelId: string | null = null;
 let isModelLoading = false;
+let cancelLoadRequested = false;
 let abortController: AbortController | null = null;
 
 export async function detectBestHardwareDevice(preference: 'auto' | 'webgpu' | 'wasm' = 'auto'): Promise<HardwareDevice> {
@@ -73,6 +75,7 @@ export async function loadModelPipeline(
   }
 
   isModelLoading = true;
+  cancelLoadRequested = false;
   onProgress?.({
     modelId: model.id,
     status: 'downloading',
@@ -89,6 +92,10 @@ export async function loadModelPipeline(
       device: device === 'webgpu' ? 'webgpu' : 'wasm',
       dtype: model.defaultDtype,
       progress_callback: (item: { status?: string; progress?: number; loaded?: number; total?: number; file?: string }) => {
+        if (cancelLoadRequested) {
+          isModelLoading = false;
+          throw new Error('Model loading and caching was cancelled.');
+        }
         if (!onProgress) return;
         const progressNum = typeof item.progress === 'number' ? Math.round(item.progress) : 0;
         onProgress({
@@ -101,6 +108,11 @@ export async function loadModelPipeline(
         });
       },
     });
+
+    if (cancelLoadRequested) {
+      isModelLoading = false;
+      throw new Error('Model loading and caching was cancelled.');
+    }
 
     activeGenerator = generator;
     activeModelId = model.id;
@@ -180,6 +192,63 @@ export async function loadModelPipeline(
 }
 
 /**
+ * Check for direct user command triggers for tools
+ */
+export async function checkDirectToolInvocation(userMessage: string): Promise<string | null> {
+  const trimmed = userMessage.trim();
+  if (/^!(?:weather|w)\s+(.+)/i.test(trimmed)) {
+    const match = trimmed.match(/^!(?:weather|w)\s+(.+)/i);
+    const city = match?.[1] || '';
+    const res = await executeTool('weather_info', { city });
+    return res.renderedSummary || null;
+  }
+  if (/^!(?:search|google|web)\s+(.+)/i.test(trimmed)) {
+    const match = trimmed.match(/^!(?:search|google|web)\s+(.+)/i);
+    const query = match?.[1] || '';
+    const res = await executeTool('web_search', { query });
+    return res.renderedSummary || null;
+  }
+  if (/^!(?:wiki|wikipedia)\s+(.+)/i.test(trimmed)) {
+    const match = trimmed.match(/^!(?:wiki|wikipedia)\s+(.+)/i);
+    const query = match?.[1] || '';
+    const res = await executeTool('wikipedia', { query });
+    return res.renderedSummary || null;
+  }
+  if (/^!(?:location|loc|whereami)\b/i.test(trimmed)) {
+    const res = await executeTool('location_info', {});
+    return res.renderedSummary || null;
+  }
+  if (/^!(?:device|specs|system|hardware)\b/i.test(trimmed)) {
+    const res = await executeTool('device_info', {});
+    return res.renderedSummary || null;
+  }
+  return null;
+}
+
+async function resolveToolCallsInResponse(
+  text: string,
+  onTokenUpdate?: (tokenPiece: string, fullAccumulated: string) => void
+): Promise<string> {
+  const toolCalls = extractToolCalls(text);
+  if (toolCalls.length === 0) return text;
+
+  let resolved = text;
+  for (const call of toolCalls) {
+    try {
+      const toolRes = await executeTool(call.toolName, call.args);
+      const output = toolRes.renderedSummary || JSON.stringify(toolRes.result, null, 2);
+      resolved = resolved.replace(call.rawMatch, `\n\n${output}\n\n`);
+    } catch (err: unknown) {
+      resolved = resolved.replace(call.rawMatch, `\n\n[Tool execution failed: ${String(err)}]\n\n`);
+    }
+  }
+
+  const cleaned = cleanModelResponse(resolved);
+  onTokenUpdate?.('', cleaned);
+  return cleaned;
+}
+
+/**
  * Stream conversational completion from persona model
  */
 export async function streamPersonaResponse({
@@ -207,6 +276,20 @@ export async function streamPersonaResponse({
   }) => void;
   onProgress?: (prog: DownloadProgress) => void;
 }): Promise<string> {
+  // Check for direct tool shortcuts first (!weather, !search, !wiki, !location, !device)
+  const directToolResult = await checkDirectToolInvocation(userMessage);
+  if (directToolResult) {
+    onToken(directToolResult, directToolResult);
+    onTelemetry?.({
+      ttftMs: 20,
+      tokensPerSec: 50,
+      totalMs: 40,
+      tokenCount: directToolResult.length,
+      device: 'wasm',
+    });
+    return directToolResult;
+  }
+
   const startTime = performance.now();
   let firstTokenTime: number | null = null;
   let tokenCount = 0;
@@ -215,7 +298,7 @@ export async function streamPersonaResponse({
 
   // If Cloud Model (Gemini 3.8 Flash)
   if (model.family === 'cloud') {
-    const systemPrompt = getPersonaPrompt(false);
+    const systemPrompt = getPersonaPrompt(false) + getToolCallingSystemPrompt();
     const messagesPayload = [
       ...history.slice(-8).map((m) => ({ role: m.role, content: m.content })),
       { role: 'user', content: userMessage },
@@ -281,7 +364,7 @@ export async function streamPersonaResponse({
       }
     }
 
-    const cleanedFinal = cleanModelResponse(accumulatedText);
+    const cleanedFinal = await resolveToolCallsInResponse(cleanModelResponse(accumulatedText), (p, full) => onToken(p, full));
     return cleanedFinal;
   }
 
@@ -297,13 +380,13 @@ export async function streamPersonaResponse({
       );
     }
 
-    const systemPrompt = getPersonaPrompt(false);
+    const systemPrompt = getPersonaPrompt(false) + getToolCallingSystemPrompt();
     const messagesPayload = [
       ...history.slice(-10).map((m) => ({ role: m.role, content: m.content })),
       { role: 'user', content: userMessage },
     ];
 
-    const response = await fetch('/api/chat/provider', {
+    let response = await fetch('/api/chat/provider', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -315,11 +398,52 @@ export async function streamPersonaResponse({
         maxTokens,
       }),
       signal: abortController.signal,
-    });
+    }).catch(() => null);
 
-    if (!response.ok) {
-      const errJson = await response.json().catch(() => ({}));
-      throw new Error(errJson.error || `${model.name} request failed (${response.status})`);
+    // Fallback: If server proxy is unavailable or returned 404, fall back to direct browser fetch for CORS-capable providers (Groq, OpenAI, etc.)
+    if (!response || response.status === 404) {
+      const directEndpoints: Record<string, string> = {
+        groq: 'https://api.groq.com/openai/v1/chat/completions',
+        openai: 'https://api.openai.com/v1/chat/completions',
+        deepseek: 'https://api.deepseek.com/chat/completions',
+        xai: 'https://api.x.ai/v1/chat/completions',
+      };
+      const directUrl = directEndpoints[providerId];
+      if (directUrl && apiKey) {
+        const defaultModels: Record<string, string> = {
+          groq: 'llama-3.3-70b-versatile',
+          openai: 'gpt-4o',
+          deepseek: 'deepseek-chat',
+          xai: 'grok-2-latest',
+        };
+        const directModel = configuredSubmodel || defaultModels[providerId] || 'llama-3.3-70b-versatile';
+        const formattedMessages = [
+          { role: 'system', content: systemPrompt },
+          ...messagesPayload,
+        ];
+        response = await fetch(directUrl, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            model: directModel,
+            messages: formattedMessages,
+            max_tokens: Math.min(Math.max(Number(maxTokens) || 512, 64), 4096),
+            temperature: 0.85,
+            stream: true,
+          }),
+          signal: abortController.signal,
+        });
+      }
+    }
+
+    if (!response || !response.ok) {
+      const errJson = response ? await response.json().catch(() => ({})) : {};
+      const statusStr = response ? ` (${response.status})` : '';
+      const detail = errJson.error?.message || errJson.error || `${model.name} request failed${statusStr}`;
+      throw new Error(detail);
     }
 
     const reader = response.body?.getReader();
@@ -337,19 +461,25 @@ export async function streamPersonaResponse({
       buffer = lines.pop() || '';
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data: ')) {
+          const rawData = trimmed.slice(6).trim();
+          if (rawData === '[DONE]') continue;
           try {
-            const data = JSON.parse(line.slice(6));
+            const data = JSON.parse(rawData);
             if (data.error) {
-              throw new Error(data.error);
+              const errMsg = typeof data.error === 'string' ? data.error : data.error?.message || 'API error';
+              throw new Error(errMsg);
             }
-            if (data.text) {
+            // Support both internal proxy format ({ text: "..." }) and direct OpenAI/Groq SSE format ({ choices: [{ delta: { content: "..." } }] })
+            const incomingText = data.text !== undefined ? data.text : (data.choices?.[0]?.delta?.content || '');
+            if (incomingText) {
               if (firstTokenTime === null) {
                 firstTokenTime = performance.now();
               }
               tokenCount++;
-              accumulatedText += data.text;
-              onToken(data.text, cleanModelResponse(accumulatedText));
+              accumulatedText += incomingText;
+              onToken(incomingText, cleanModelResponse(accumulatedText));
 
               const now = performance.now();
               const elapsedSec = (now - startTime) / 1000;
@@ -371,7 +501,7 @@ export async function streamPersonaResponse({
       }
     }
 
-    const cleanedFinal = cleanModelResponse(accumulatedText);
+    const cleanedFinal = await resolveToolCallsInResponse(cleanModelResponse(accumulatedText), (p, full) => onToken(p, full));
     return cleanedFinal;
   }
 
@@ -457,13 +587,17 @@ export async function streamPersonaResponse({
     }
   }
 
-  const finalResult = cleanModelResponse(accumulatedText);
+  const finalResult = await resolveToolCallsInResponse(cleanModelResponse(accumulatedText), (p, full) => onToken(p, full));
   return finalResult;
 }
 
 export function stopCurrentGeneration(): void {
+  cancelLoadRequested = true;
+  isModelLoading = false;
   if (abortController) {
-    abortController.abort();
+    try {
+      abortController.abort();
+    } catch {}
     abortController = null;
   }
 }
