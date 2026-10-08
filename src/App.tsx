@@ -35,6 +35,8 @@ import {
   saveAccountSession,
   loadEquippedOutfitId,
   saveEquippedOutfitId,
+  loadUnlockedOutfits,
+  saveUnlockedOutfits,
   getOrCreateDeviceFingerprint,
   getBrowserDeviceLabel,
   isUserPremium,
@@ -66,6 +68,7 @@ import {
   DEFAULT_OUTFIT_ID,
   getThemeById,
   getOutfitById,
+  resolveSecretOutfitsByRedeemCode,
   CHAT_ERROR_CONFIG,
 } from './constants';
 import { Header } from './components/Header';
@@ -87,6 +90,8 @@ import { AddIntegrationModal } from './components/AddIntegrationModal';
 import { DocsPage } from './components/DocsPage';
 import { ActDirectorPage } from './components/ActDirectorPage';
 import { HumanizerPage } from './components/HumanizerPage';
+import { VoiceTesterPage } from './components/VoiceTesterPage';
+import { MMDStudioPage } from './components/MMDStudioPage';
 import { PremiumModal } from './components/PremiumModal';
 import { IntegrationLibraryItem } from './constants';
 import { dispatchChatToWebhooks } from './lib/integrations';
@@ -123,6 +128,12 @@ export default function App() {
       if (path.startsWith('/act')) {
         return '/act';
       }
+      if (path.startsWith('/mmd')) {
+        return '/mmd';
+      }
+      if (path.startsWith('/voice')) {
+        return '/voice';
+      }
       return path.startsWith('/chat') ? '/chat' : '/';
     }
     return '/';
@@ -154,6 +165,14 @@ export default function App() {
         setCurrentRoute('/act');
         return;
       }
+      if (path.startsWith('/mmd')) {
+        setCurrentRoute('/mmd');
+        return;
+      }
+      if (path.startsWith('/voice')) {
+        setCurrentRoute('/voice');
+        return;
+      }
       setCurrentRoute(path.startsWith('/chat') ? '/chat' : '/');
     };
     window.addEventListener('popstate', handlePopState);
@@ -176,6 +195,10 @@ export default function App() {
         normalized = path;
       } else if (path.startsWith('/act')) {
         normalized = '/act';
+      } else if (path.startsWith('/mmd')) {
+        normalized = '/mmd';
+      } else if (path.startsWith('/voice')) {
+        normalized = '/voice';
       }
       window.history.pushState(null, '', normalized);
       setCurrentRoute(normalized);
@@ -406,6 +429,12 @@ export default function App() {
   // ----------------------------------------------------
   const [accountUser, setAccountUser] = useState<AccountUser | null>(() => loadAccountSession());
   const [equippedOutfitId, setEquippedOutfitId] = useState<string>(() => loadEquippedOutfitId());
+  const [unlockedOutfitIds, setUnlockedOutfitIds] = useState<string[]>(() => {
+    const localUnlocked = loadUnlockedOutfits();
+    const sessionUser = loadAccountSession();
+    const userUnlocked = Array.isArray(sessionUser?.unlocked_outfits) ? sessionUser.unlocked_outfits : [];
+    return Array.from(new Set([...localUnlocked, ...userUnlocked]));
+  });
   const [externalAuthModalRequest, setExternalAuthModalRequest] = useState<number>(0);
   const [lastUserMessageAt, setLastUserMessageAt] = useState<number>(0);
 
@@ -416,21 +445,47 @@ export default function App() {
     if (candidate.isPremium && !isPremium) {
       return getOutfitById(DEFAULT_OUTFIT_ID);
     }
+    if (
+      candidate.isSecret &&
+      !unlockedOutfitIds.includes(candidate.id) &&
+      !unlockedOutfitIds.includes(candidate.fileName)
+    ) {
+      return getOutfitById(DEFAULT_OUTFIT_ID);
+    }
     return candidate;
-  }, [equippedOutfitId, isPremium]);
+  }, [equippedOutfitId, isPremium, unlockedOutfitIds]);
 
   useEffect(() => {
     saveAccountSession(accountUser);
+    if (accountUser && Array.isArray(accountUser.unlocked_outfits) && accountUser.unlocked_outfits.length > 0) {
+      setUnlockedOutfitIds((prev) => {
+        const merged = Array.from(new Set([...prev, ...(accountUser.unlocked_outfits || [])]));
+        return merged.length === prev.length ? prev : merged;
+      });
+    }
   }, [accountUser]);
 
   useEffect(() => {
     saveEquippedOutfitId(equippedOutfitId);
   }, [equippedOutfitId]);
 
+  useEffect(() => {
+    saveUnlockedOutfits(unlockedOutfitIds);
+  }, [unlockedOutfitIds]);
+
   const handleSelectOutfit = useCallback(
     (outfitId: string) => {
       const outfit = getOutfitById(outfitId);
       if (outfit.isPremium && !isUserPremium(accountUser)) {
+        setIsSidebarOpen(true);
+        setExternalAuthModalRequest((n) => n + 1);
+        return;
+      }
+      if (
+        outfit.isSecret &&
+        !unlockedOutfitIds.includes(outfit.id) &&
+        !unlockedOutfitIds.includes(outfit.fileName)
+      ) {
         setIsSidebarOpen(true);
         setExternalAuthModalRequest((n) => n + 1);
         return;
@@ -443,6 +498,7 @@ export default function App() {
           body: JSON.stringify({
             userId: accountUser.id,
             equippedOutfitId: outfit.id,
+            unlockedOutfits: unlockedOutfitIds,
           }),
         })
           .then((r) => r.json())
@@ -452,7 +508,7 @@ export default function App() {
           .catch(() => {});
       }
     },
-    [accountUser]
+    [accountUser, unlockedOutfitIds]
   );
 
   const handleSignUp = useCallback(
@@ -473,7 +529,7 @@ export default function App() {
       }
       const user = data.user as AccountUser;
       setAccountUser(user);
-      // Sync existing local conversations & custom themes up to NeonDB for this new user
+      // Sync existing local conversations, custom themes & unlocked outfits up to NeonDB for this new user
       fetch('/api/account/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -481,10 +537,11 @@ export default function App() {
           userId: user.id,
           conversations,
           customThemes,
+          unlockedOutfits: unlockedOutfitIds,
         }),
       }).catch(() => {});
     },
-    [conversations, customThemes]
+    [conversations, customThemes, unlockedOutfitIds]
   );
 
   const handleSignIn = useCallback(
@@ -504,6 +561,14 @@ export default function App() {
         throw new Error(data.error || 'Failed to sign in.');
       }
       const user = data.user as AccountUser;
+      const serverUnlocked = Array.isArray(user.unlocked_outfits)
+        ? user.unlocked_outfits
+        : Array.isArray(data.unlockedOutfits)
+        ? data.unlockedOutfits
+        : [];
+      if (serverUnlocked.length > 0) {
+        setUnlockedOutfitIds((prev) => Array.from(new Set([...prev, ...serverUnlocked])));
+      }
       setAccountUser(user);
       if (user.equipped_outfit_id) {
         setEquippedOutfitId(user.equipped_outfit_id);
@@ -523,6 +588,7 @@ export default function App() {
             userId: user.id,
             conversations,
             customThemes,
+            unlockedOutfits: unlockedOutfitIds,
           }),
         }).catch(() => {});
       }
@@ -531,12 +597,14 @@ export default function App() {
         saveStoredCustomThemes(data.customThemes);
       }
     },
-    [conversations, customThemes]
+    [conversations, customThemes, unlockedOutfitIds]
   );
 
   const handleSignOut = useCallback(() => {
     setAccountUser(null);
     setEquippedOutfitId(DEFAULT_OUTFIT_ID);
+    setUnlockedOutfitIds([]);
+    saveUnlockedOutfits([]);
   }, []);
 
   const handleUpdateProfile = useCallback(
@@ -550,6 +618,7 @@ export default function App() {
           username: updates.username,
           displayName: updates.displayName,
           avatarUrl: updates.avatarUrl,
+          unlockedOutfits: unlockedOutfitIds,
         }),
       });
       const data = await resp.json();
@@ -560,7 +629,7 @@ export default function App() {
         setAccountUser(data.user);
       }
     },
-    [accountUser]
+    [accountUser, unlockedOutfitIds]
   );
 
   const handleRedeemCode = useCallback(
@@ -578,14 +647,27 @@ export default function App() {
       if (!resp.ok || data.error) {
         throw new Error(data.error || 'Failed to redeem code.');
       }
+      const matchedSecret = resolveSecretOutfitsByRedeemCode(code).map((o) => o.id);
       if (data.user) {
-        setAccountUser(data.user);
+        const userUnlocked = Array.isArray(data.user.unlocked_outfits)
+          ? data.user.unlocked_outfits
+          : [];
+        const combinedUnlocked = Array.from(
+          new Set([...unlockedOutfitIds, ...userUnlocked, ...matchedSecret])
+        );
+        setUnlockedOutfitIds(combinedUnlocked);
+        setAccountUser({
+          ...data.user,
+          unlocked_outfits: combinedUnlocked,
+        });
+      } else if (matchedSecret.length > 0) {
+        setUnlockedOutfitIds((prev) => Array.from(new Set([...prev, ...matchedSecret])));
       }
     },
-    [accountUser]
+    [accountUser, unlockedOutfitIds]
   );
 
-  // Sync conversations & custom themes to NeonDB when logged in
+  // Sync conversations, custom themes & unlocked outfits to NeonDB when logged in
   useEffect(() => {
     if (!accountUser) return;
     const syncTimer = setTimeout(() => {
@@ -596,11 +678,12 @@ export default function App() {
           userId: accountUser.id,
           conversations,
           customThemes,
+          unlockedOutfits: unlockedOutfitIds,
         }),
       }).catch(() => {});
     }, 1200);
     return () => clearTimeout(syncTimer);
-  }, [accountUser, conversations, customThemes]);
+  }, [accountUser, conversations, customThemes, unlockedOutfitIds]);
 
   // Global Mouse Click Echoing Shockwave Ripples (0.6s total duration)
   const [clickRipples, setClickRipples] = useState<Array<{ id: number; x: number; y: number }>>([]);
@@ -2010,6 +2093,33 @@ export default function App() {
     );
   }
 
+  // Render MMD Studio Stage at '/mmd'
+  if (currentRoute.startsWith('/mmd')) {
+    return (
+      <>
+        {shockwaveOverlay}
+        <MMDStudioPage
+          onBackToChat={() => navigateTo('/chat')}
+          onNavigateHome={() => navigateTo('/')}
+        />
+      </>
+    );
+  }
+
+  // Render Voice Diagnostics & TTS Engine Tester at '/voice'
+  if (currentRoute.startsWith('/voice')) {
+    return (
+      <>
+        {shockwaveOverlay}
+        <VoiceTesterPage
+          onNavigateToChat={() => navigateTo('/chat')}
+          onNavigateHome={() => navigateTo('/')}
+          onNavigateToDocs={(p) => navigateTo(p || '/docs')}
+        />
+      </>
+    );
+  }
+
   // Render MuxAI Humanizer & Turnitin-Reverse at '/humanizer' (and redirects)
   if (currentRoute.startsWith('/humanizer')) {
     return (
@@ -2134,6 +2244,7 @@ export default function App() {
         equippedOutfitId={activeOutfit.id}
         onSelectOutfit={handleSelectOutfit}
         isPremiumUser={isPremium}
+        unlockedOutfitIds={unlockedOutfitIds}
         onRequirePremium={() => {
           setIsPremiumModalOpen(true);
           setIsThemeSidebarOpen(false);

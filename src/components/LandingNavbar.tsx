@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { ArrowRight, BookOpen, Menu, X, Sparkles, Shield, Terminal, Crown } from 'lucide-react';
+import { ArrowRight, BookOpen, Menu, X, Sparkles, Shield, Terminal, Crown, Bot } from 'lucide-react';
 
 export interface LandingNavbarProps {
   onStartChat: () => void;
@@ -100,6 +100,13 @@ export const LandingNavbar: React.FC<LandingNavbarProps> = ({
               MCP
             </a>
             <a
+              href="#automation"
+              onClick={(e) => handleSectionClick(e, 'automation')}
+              className="text-xs font-semibold text-neutral-500 hover:text-neutral-900 transition-colors cursor-pointer"
+            >
+              Automation
+            </a>
+            <a
               href="#pricing"
               onClick={(e) => handleSectionClick(e, 'pricing')}
               className="text-xs font-semibold text-neutral-500 hover:text-neutral-900 transition-colors cursor-pointer"
@@ -119,19 +126,19 @@ export const LandingNavbar: React.FC<LandingNavbarProps> = ({
               onClick={onStartChat}
               className="inline-flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-semibold bg-[#1e2029] text-white hover:bg-neutral-800 shadow-sm active:scale-95 transition-all group cursor-pointer"
             >
-              <span>Start Chatting</span>
+              <span>LM Chat</span>
               <ArrowRight className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
             </button>
           </div>
 
-          {/* Mobile UI: Start Chatting + Hamburger */}
+          {/* Mobile UI: AI Chat + Hamburger */}
           <div className="flex md:hidden items-center gap-2">
             <button
               type="button"
               onClick={onStartChat}
               className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-[#1e2029] text-white hover:bg-neutral-800 shadow-sm active:scale-95 transition-all group cursor-pointer"
             >
-              <span>Start Chatting</span>
+              <span>LM Chat</span>
               <ArrowRight className="w-3 h-3 group-hover:translate-x-0.5 transition-transform" />
             </button>
             <button
@@ -217,6 +224,15 @@ export const LandingNavbar: React.FC<LandingNavbarProps> = ({
               </a>
 
               <a
+                href="#automation"
+                onClick={(e) => handleSectionClick(e, 'automation')}
+                className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium text-neutral-700 hover:text-neutral-900 hover:bg-neutral-100/80 transition-colors cursor-pointer"
+              >
+                <Bot className="w-4 h-4 text-neutral-400" />
+                <span>Automation</span>
+              </a>
+
+              <a
                 href="#pricing"
                 onClick={(e) => handleSectionClick(e, 'pricing')}
                 className="flex items-center gap-2.5 px-3 py-2.5 rounded-xl text-sm font-medium text-neutral-700 hover:text-neutral-900 hover:bg-neutral-100/80 transition-colors cursor-pointer"
@@ -248,7 +264,7 @@ export const LandingNavbar: React.FC<LandingNavbarProps> = ({
                 }}
                 className="w-full flex items-center justify-center gap-2 py-2.5 px-4 rounded-xl text-sm font-semibold bg-[#1e2029] text-white hover:bg-neutral-800 shadow-sm active:scale-95 transition-all cursor-pointer"
               >
-                <span>Start Chatting</span>
+                <span>LM Chat</span>
                 <ArrowRight className="w-4 h-4" />
               </button>
             </div>
