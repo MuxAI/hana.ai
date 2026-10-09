@@ -104,6 +104,23 @@ class LipSyncManager {
    */
   public update(delta: number, _elapsed: number) {
     const now = performance.now();
+const isExplicitActive = this.isSpeaking && now <= this.activeUntil;
+    const isActive = this.isSpeaking;
+
+    if (this.isSpeaking && !isExplicitActive) {
+      // Natural subtle speech cadence with clear lip-closure between syllables (~3.2Hz, lips closed half the time)
+      const t = now * 0.010;
+      const cycle = Math.sin(t * 3.2);
+      // Closed when cycle <= 0.22 (so lips fully close between syllables)
+      const mouthOpen = cycle > 0.22 ? (cycle - 0.22) * 0.22 : 0;
+      this.targetVisemes.aa = Math.max(0, mouthOpen * 0.40);
+      this.targetVisemes.ih = Math.max(0, mouthOpen * 0.20);
+      this.targetVisemes.oh = Math.max(0, mouthOpen * 0.22);
+      this.targetVisemes.ee = Math.max(0, mouthOpen * 0.20);
+      this.targetVisemes.ou = Math.max(0, mouthOpen * 0.16);
+    }
+
+
     const isActiveWindow = this.isSpeaking && now <= this.activeUntil;
 
     // During active word utterance, lerp smoothly. During pause or silence, decay fast to 0

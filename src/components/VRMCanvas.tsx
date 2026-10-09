@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils, VRM } from '@pixiv/three-vrm';
 import { retargetAnimationFromUrl } from 'vrm-mixamo-retarget';
-import { VRM_CONFIG, AI_PROFILE, THEME_COLORS, getWaitingAnimationCandidateUrls } from '../constants';
+import { VRM_CONFIG, AI_PROFILE, THEME_COLORS, MODEL_SOURCE_DOMAIN, getWaitingAnimationCandidateUrls } from '../constants';
 import { lipSyncManager } from '../lib/lipSync';
 import { fetchVRMWithCache } from '../lib/vrmCache';
 import { AvatarEmotion } from '../lib/emotionDetector';
@@ -18,6 +18,22 @@ interface VRMCanvasProps {
   modelFileName?: string;
   lastUserMessageAt?: number;
   emotion?: AvatarEmotion;
+  interactive?: boolean;
+  enablePointerTracking?: boolean;
+  disableIdleWaitingAnimations?: boolean;
+  nodTrigger?: number;
+  customAnimationTrigger?: {
+    fileName?: string;
+    clipFileName?: string;
+    triggerId: number;
+    loopOnce?: boolean;
+  } | null;
+  lookTargetOffset?: {
+    x?: number;
+    y?: number;
+    yaw?: number;
+    pitch?: number;
+  } | null;
 }
 
 export const VRMCanvas: React.FC<VRMCanvasProps> = ({
@@ -29,9 +45,57 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
   modelFileName = 'hana_v1.2_vrm1.vrm',
   lastUserMessageAt = 0,
   emotion = 'neutral',
+  interactive = true,
+  enablePointerTracking = true,
+  disableIdleWaitingAnimations = false,
+  nodTrigger = 0,
+  customAnimationTrigger = null,
+  lookTargetOffset = null,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  const interactiveRef = useRef(interactive);
+  useEffect(() => {
+    interactiveRef.current = interactive;
+  }, [interactive]);
+
+  const enablePointerTrackingRef = useRef(enablePointerTracking);
+  useEffect(() => {
+    enablePointerTrackingRef.current = enablePointerTracking;
+  }, [enablePointerTracking]);
+
+  const disableIdleWaitingAnimationsRef = useRef(disableIdleWaitingAnimations);
+  useEffect(() => {
+    disableIdleWaitingAnimationsRef.current = disableIdleWaitingAnimations;
+  }, [disableIdleWaitingAnimations]);
+
+  const nodProgressRef = useRef(0);
+  useEffect(() => {
+    if (nodTrigger && nodTrigger > 0) {
+      nodProgressRef.current = 1.0;
+    }
+  }, [nodTrigger]);
+
+  const lookTargetOffsetRef = useRef<{ x?: number; y?: number; yaw?: number; pitch?: number } | null>(lookTargetOffset);
+  useEffect(() => {
+    lookTargetOffsetRef.current = lookTargetOffset;
+  }, [lookTargetOffset]);
+
+  const playCustomAnimationRef = useRef<((fileName: string) => void) | null>(null);
+  const pendingCustomAnimFileRef = useRef<string | null>(null);
+  const isCustomHeadGazeAllowedRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    const targetFile = customAnimationTrigger?.fileName || customAnimationTrigger?.clipFileName;
+    if (targetFile && customAnimationTrigger?.triggerId && customAnimationTrigger.triggerId > 0) {
+      if (playCustomAnimationRef.current) {
+        playCustomAnimationRef.current(targetFile);
+      } else {
+        pendingCustomAnimFileRef.current = targetFile;
+      }
+    }
+  }, [customAnimationTrigger?.triggerId, customAnimationTrigger?.fileName, customAnimationTrigger?.clipFileName]);
 
   // Store emotion state in ref to avoid recreating Three.js scene while updating expressions smoothly
   const emotionRef = useRef<AvatarEmotion>(emotion);
@@ -260,10 +324,10 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
               if (rightLowerArm) rightLowerArm.rotation.set(0.0, 0.22, 0.1);
             }
 
-            // Initial preset expressions
+            // Initial preset expressions (strictly neutral)
             if (vrm.expressionManager) {
               try {
-                vrm.expressionManager.setValue('relaxed', 0.25);
+                vrm.expressionManager.setValue('relaxed', 0.0);
                 vrm.expressionManager.setValue('happy', 0.0);
                 vrm.expressionManager.setValue('surprised', 0.0);
                 vrm.expressionManager.setValue('sad', 0.0);
@@ -357,6 +421,113 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
                     waitingActionsRef.current.push(waitAction);
                   }
                 });
+              }
+
+              // 5. Preload & on-demand runner for interview/custom transition animations (mixamo_buttonpush.fbx, mixamo_thankful.fbx)
+              const customActionCache = new Map<string, THREE.AnimationAction>();
+              const getCustomCandidateUrls = (fileName: string) => [
+                `${MODEL_SOURCE_DOMAIN}/${fileName}`,
+                ...getWaitingAnimationCandidateUrls(fileName),
+              ];
+
+              const ensureCustomAction = async (fileName: string): Promise<THREE.AnimationAction | null> => {
+                if (customActionCache.has(fileName)) {
+                  return customActionCache.get(fileName)!;
+                }
+                const shouldFilterHeadNeck = fileName.includes('buttonpush');
+                const clip = await loadAndRetargetClip(getCustomCandidateUrls(fileName), shouldFilterHeadNeck);
+                if (clip && !isDisposed && mixerRef.current) {
+                  const action = mixerRef.current.clipAction(clip);
+                  action.setLoop(THREE.LoopOnce, 1);
+                  action.clampWhenFinished = true;
+                  customActionCache.set(fileName, action);
+                  return action;
+                }
+                return null;
+              };
+
+              // Preload default transition & wrapup animations in background
+              ensureCustomAction('mixamo_buttonpush.fbx');
+              ensureCustomAction('mixamo_thankful.fbx');
+
+              playCustomAnimationRef.current = async (fileName: string) => {
+                if (isDisposed || isFallSequenceActiveRef.current) return;
+                const action = await ensureCustomAction(fileName);
+                const mixer = mixerRef.current;
+                const idleAction = idleActionRef.current;
+                if (!action || !mixer || !idleAction || isDisposed) return;
+
+                if (waitFinishTimeoutId) {
+                  clearTimeout(waitFinishTimeoutId);
+                  waitFinishTimeoutId = null;
+                }
+                if (currentWaitFinishedListener) {
+                  mixer.removeEventListener('finished', currentWaitFinishedListener);
+                  currentWaitFinishedListener = null;
+                }
+
+                const fromAction = activeWaitActionRef.current || idleAction;
+                activeWaitActionRef.current = action;
+                isCustomHeadGazeAllowedRef.current = fileName.includes('buttonpush');
+
+                action.reset();
+                action.setLoop(THREE.LoopOnce, 1);
+                action.clampWhenFinished = true;
+                action.enabled = true;
+                action.setEffectiveTimeScale(1);
+                action.setEffectiveWeight(1);
+                if (fromAction !== action) {
+                  action.crossFadeFrom(fromAction, 0.35, false);
+                } else {
+                  action.fadeIn(0.25);
+                }
+                action.play();
+
+                let hasHandledCustomEnd = false;
+                const handleCustomComplete = () => {
+                  if (hasHandledCustomEnd || isDisposed) return;
+                  hasHandledCustomEnd = true;
+                  isCustomHeadGazeAllowedRef.current = false;
+                  if (currentWaitFinishedListener) {
+                    mixer.removeEventListener('finished', currentWaitFinishedListener);
+                    currentWaitFinishedListener = null;
+                  }
+                  if (waitFinishTimeoutId) {
+                    clearTimeout(waitFinishTimeoutId);
+                    waitFinishTimeoutId = null;
+                  }
+                  if (activeWaitActionRef.current === action) {
+                    activeWaitActionRef.current = null;
+                    if (!isFallSequenceActiveRef.current && idleActionRef.current) {
+                      const idle = idleActionRef.current;
+                      idle.reset();
+                      idle.setLoop(THREE.LoopRepeat, Infinity);
+                      idle.enabled = true;
+                      idle.setEffectiveTimeScale(1);
+                      idle.setEffectiveWeight(1);
+                      idle.crossFadeFrom(action, 0.45, false);
+                      idle.play();
+                    }
+                  }
+                };
+
+                const onCustomFinished = (e: any) => {
+                  if (e.action === action) {
+                    handleCustomComplete();
+                  }
+                };
+
+                currentWaitFinishedListener = onCustomFinished;
+                mixer.addEventListener('finished', onCustomFinished);
+
+                const clipDurationMs = (action.getClip()?.duration || 3.2) * 1000;
+                waitFinishTimeoutId = setTimeout(handleCustomComplete, Math.max(500, clipDurationMs - 120));
+              };
+
+              if (pendingCustomAnimFileRef.current) {
+                const pendingFile = pendingCustomAnimFileRef.current;
+                pendingCustomAnimFileRef.current = null;
+                playCustomAnimationRef.current(pendingFile);
               }
             };
 
@@ -692,7 +863,7 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
       if (vrm) {
         // 60-second message inactivity counter -> select random waiting animation & auto-reset
-        if (!isFallSequenceActiveRef.current) {
+        if (!isFallSequenceActiveRef.current && !disableIdleWaitingAnimationsRef.current) {
           waitInactivityTimerRef.current += delta;
           const waitIntervalSec = VRM_CONFIG.interaction.waitAnimationIntervalSec || 60.0;
           if (waitInactivityTimerRef.current >= waitIntervalSec) {
@@ -740,13 +911,30 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
         // ----------------------------------------------------
         // Simplified v1 Rotational Logic:
-        // Smooth lerp reset to 0 when not holding
+        // Smooth lerp reset to 0 (or towards lookTargetOffset) when not holding
         // ----------------------------------------------------
         if (!isHoldingOnBody) {
-          targetBodyRotationY = THREE.MathUtils.lerp(targetBodyRotationY, 0, delta * 3.8);
+          const customLook = lookTargetOffsetRef.current;
+          const rawLookX = customLook
+            ? Number.isFinite(customLook.yaw)
+              ? customLook.yaw!
+              : Number.isFinite(customLook.x)
+              ? customLook.x!
+              : 0
+            : 0;
+          const desiredBodyRotY = rawLookX * 0.22;
+          if (Number.isFinite(desiredBodyRotY)) {
+            targetBodyRotationY = THREE.MathUtils.lerp(targetBodyRotationY, desiredBodyRotY, delta * 3.8);
+          }
         }
 
+        if (!Number.isFinite(targetBodyRotationY)) {
+          targetBodyRotationY = 0;
+        }
         currentBodyRotationY = THREE.MathUtils.lerp(currentBodyRotationY, targetBodyRotationY, delta * 12.0);
+        if (!Number.isFinite(currentBodyRotationY)) {
+          currentBodyRotationY = 0;
+        }
 
         // Apply position and rotation directly to scene
         vrm.scene.position.set(0, VRM_CONFIG.interaction.bodyOffsetY, 0);
@@ -881,7 +1069,9 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
             break;
           case 'neutral':
           default:
-            // "neutral" (the current default usual face emotion)
+            // "neutral" strictly neutral face - no smile or relaxed smirk
+            targetRelaxed = 0.0;
+            targetHappy = 0.0;
             break;
         }
 
@@ -905,11 +1095,33 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
         // Expression Manager Updates
         if (vrm.expressionManager) {
-          vrm.expressionManager.setValue('aa', Math.min(1.0, visemes.aa + currentMouthOpen));
-          vrm.expressionManager.setValue('ih', visemes.ih);
-          vrm.expressionManager.setValue('ou', visemes.ou);
-          vrm.expressionManager.setValue('ee', visemes.ee);
-          vrm.expressionManager.setValue('oh', visemes.oh);
+          const speakingNow = isSpeakingRef.current || lipSyncManager.getIsSpeaking();
+          let dynamicMouth = 0;
+          if (speakingNow && visemes.aa === 0 && visemes.ih === 0 && visemes.oh === 0) {
+            const t = elapsed * 7.5;
+            const cycle = Math.sin(t);
+            dynamicMouth = cycle > 0.30 ? (cycle - 0.30) * 0.20 : 0;
+          }
+
+          // Subtle, natural mouth movements (capped at gentle amplitudes)
+          const aaVal = speakingNow ? Math.min(0.28, Math.max(visemes.aa, dynamicMouth) + currentMouthOpen * 0.5) : 0;
+          const ihVal = speakingNow ? Math.min(0.20, Math.max(visemes.ih, dynamicMouth * 0.35)) : 0;
+          const ouVal = speakingNow ? Math.min(0.18, Math.max(visemes.ou, dynamicMouth * 0.25)) : 0;
+          const eeVal = speakingNow ? Math.min(0.20, Math.max(visemes.ee, dynamicMouth * 0.30)) : 0;
+          const ohVal = speakingNow ? Math.min(0.22, Math.max(visemes.oh, dynamicMouth * 0.35)) : 0;
+
+          vrm.expressionManager.setValue('aa', aaVal);
+          vrm.expressionManager.setValue('ih', ihVal);
+          vrm.expressionManager.setValue('ou', ouVal);
+          vrm.expressionManager.setValue('ee', eeVal);
+          vrm.expressionManager.setValue('oh', ohVal);
+
+          // Support VRM 0.0 blendshape fallback keys
+          try { vrm.expressionManager.setValue('a' as any, aaVal); } catch {}
+          try { vrm.expressionManager.setValue('i' as any, ihVal); } catch {}
+          try { vrm.expressionManager.setValue('u' as any, ouVal); } catch {}
+          try { vrm.expressionManager.setValue('e' as any, eeVal); } catch {}
+          try { vrm.expressionManager.setValue('o' as any, ohVal); } catch {}
 
           // Suppress peaceful baseline expressions while angry/annoyed mood is active
           const moodSuppression = Math.max(0, 1.0 - currentAngry * 1.2);
@@ -918,6 +1130,21 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
           vrm.expressionManager.setValue('surprised', Math.min(1.0, currentSurprised + hitExpressionSurprised));
           vrm.expressionManager.setValue('sad', currentSad);
           vrm.expressionManager.setValue('angry', currentAngry);
+
+          // Direct mesh morph target fallback for VRoid and GLTF meshes (cleanly reset to 0 when not speaking)
+          vrm.scene.traverse((obj) => {
+            const mesh = obj as THREE.SkinnedMesh;
+            if (mesh.isMesh && mesh.morphTargetDictionary && mesh.morphTargetInfluences) {
+              const dict = mesh.morphTargetDictionary;
+              if (typeof dict['Fcl_MTH_A'] === 'number') mesh.morphTargetInfluences[dict['Fcl_MTH_A']] = aaVal;
+              if (typeof dict['Fcl_MTH_I'] === 'number') mesh.morphTargetInfluences[dict['Fcl_MTH_I']] = ihVal;
+              if (typeof dict['Fcl_MTH_U'] === 'number') mesh.morphTargetInfluences[dict['Fcl_MTH_U']] = ouVal;
+              if (typeof dict['Fcl_MTH_E'] === 'number') mesh.morphTargetInfluences[dict['Fcl_MTH_E']] = eeVal;
+              if (typeof dict['Fcl_MTH_O'] === 'number') mesh.morphTargetInfluences[dict['Fcl_MTH_O']] = ohVal;
+              if (typeof dict['jawOpen'] === 'number') mesh.morphTargetInfluences[dict['jawOpen']] = aaVal;
+              if (typeof dict['mouthOpen'] === 'number') mesh.morphTargetInfluences[dict['mouthOpen']] = aaVal;
+            }
+          });
         }
 
         // Blinking
@@ -939,6 +1166,9 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
               isBlinking = false;
             }
           }
+
+          // Evaluate and apply all expressions immediately to character meshes
+          vrm.expressionManager.update();
         }
 
         // Eye Saccades
@@ -950,10 +1180,10 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
           saccadeOffsetY = (Math.random() - 0.5) * 0.015;
         }
 
-        // Head & Neck Gaze Tracking (paused while full-body fall or wait animation is driving head/neck keyframes)
+        // Head & Neck Gaze Tracking (paused while full-body fall or wait animation is driving head/neck keyframes, unless custom head gaze is enabled)
         const headNode = vrm.humanoid?.getNormalizedBoneNode('head');
         const neckNode = vrm.humanoid?.getNormalizedBoneNode('neck');
-        const isWaitPlaying = Boolean(activeWaitActionRef.current);
+        const isWaitPlaying = Boolean(activeWaitActionRef.current) && !isCustomHeadGazeAllowedRef.current && !lookTargetOffsetRef.current;
 
         if (!isFalling && !isWaitPlaying && headNode && cameraRef.current) {
           headNode.getWorldPosition(scratchHeadWorldPos);
@@ -961,25 +1191,67 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
           const headScreenPos = scratchHeadWorldPos.project(cameraRef.current);
 
-          const deltaX = mouseRef.current.x - headScreenPos.x;
-          const deltaY = mouseRef.current.y - headScreenPos.y;
+          // Manual affirmative nod progress calculation
+          let manualNodX = 0;
+          if (nodProgressRef.current > 0) {
+            nodProgressRef.current = Math.max(0, nodProgressRef.current - delta * 2.2);
+            manualNodX = Math.sin((1.0 - nodProgressRef.current) * Math.PI) * 0.16;
+          }
 
-          const activeDeltaX = deltaX * (1.0 - speechFacingFactor);
-          const activeDeltaY = deltaY * (1.0 - speechFacingFactor);
+          // If lookTargetOffset is provided (e.g. looking towards the task panel in /interview), prioritize it;
+          // otherwise use pointer tracking if enabled.
+          const hasPointer = enablePointerTrackingRef.current;
+          const customLook = lookTargetOffsetRef.current;
+
+          const customX = customLook
+            ? Number.isFinite(customLook.yaw)
+              ? customLook.yaw!
+              : Number.isFinite(customLook.x)
+              ? customLook.x!
+              : null
+            : null;
+
+          const customY = customLook
+            ? Number.isFinite(customLook.pitch)
+              ? customLook.pitch!
+              : Number.isFinite(customLook.y)
+              ? customLook.y!
+              : null
+            : null;
+
+          const deltaX = customX !== null
+            ? customX
+            : hasPointer
+            ? mouseRef.current.x - headScreenPos.x
+            : 0;
+
+          const deltaY = customY !== null
+            ? customY
+            : hasPointer
+            ? mouseRef.current.y - headScreenPos.y
+            : 0;
+
+          const facingAttenuation = customLook ? speechFacingFactor * 0.3 : speechFacingFactor;
+          const activeDeltaX = Number.isFinite(deltaX) ? deltaX * (1.0 - facingAttenuation) : 0;
+          const activeDeltaY = Number.isFinite(deltaY) ? deltaY * (1.0 - facingAttenuation) : 0;
 
           const speechNodX = speechFacingFactor * Math.sin(elapsed * 4.5) * 0.02;
 
-          const targetRotY = THREE.MathUtils.clamp(activeDeltaX * 0.75, -0.85, 0.85) + saccadeOffsetX * (1.0 - speechFacingFactor * 0.6);
-          const targetRotX = THREE.MathUtils.clamp(-activeDeltaY * 0.6, -0.45, 0.45) + saccadeOffsetY * (1.0 - speechFacingFactor * 0.6) + speechNodX;
+          const targetRotY = THREE.MathUtils.clamp(activeDeltaX * 0.75, -0.85, 0.85) + (hasPointer ? saccadeOffsetX * (1.0 - speechFacingFactor * 0.6) : saccadeOffsetX * 0.4);
+          const targetRotX = THREE.MathUtils.clamp(-activeDeltaY * 0.6, -0.45, 0.45) + (hasPointer ? saccadeOffsetY * (1.0 - speechFacingFactor * 0.6) : saccadeOffsetY * 0.4) + speechNodX + manualNodX;
 
-          headNode.rotation.y = THREE.MathUtils.lerp(headNode.rotation.y, targetRotY, delta * 7.5);
-          headNode.rotation.x = THREE.MathUtils.lerp(headNode.rotation.x, targetRotX, delta * 7.5);
+          if (Number.isFinite(targetRotY) && Number.isFinite(targetRotX)) {
+            headNode.rotation.y = THREE.MathUtils.lerp(headNode.rotation.y, targetRotY, delta * 7.5);
+            headNode.rotation.x = THREE.MathUtils.lerp(headNode.rotation.x, targetRotX, delta * 7.5);
+          }
 
           if (neckNode) {
             const targetNeckY = THREE.MathUtils.clamp(activeDeltaX * 0.35, -0.4, 0.4);
-            const targetNeckX = THREE.MathUtils.clamp(-activeDeltaY * 0.25, -0.25, 0.25) + speechNodX * 0.4;
-            neckNode.rotation.y = THREE.MathUtils.lerp(neckNode.rotation.y, targetNeckY, delta * 6.0);
-            neckNode.rotation.x = THREE.MathUtils.lerp(neckNode.rotation.x, targetNeckX, delta * 6.0);
+            const targetNeckX = THREE.MathUtils.clamp(-activeDeltaY * 0.25, -0.25, 0.25) + speechNodX * 0.4 + manualNodX * 0.5;
+            if (Number.isFinite(targetNeckY) && Number.isFinite(targetNeckX)) {
+              neckNode.rotation.y = THREE.MathUtils.lerp(neckNode.rotation.y, targetNeckY, delta * 6.0);
+              neckNode.rotation.x = THREE.MathUtils.lerp(neckNode.rotation.x, targetNeckX, delta * 6.0);
+            }
           }
         }
       }
@@ -994,6 +1266,7 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
       if (!container || !camera || !renderer) return;
       const newW = container.clientWidth || window.innerWidth;
       const newH = container.clientHeight || window.innerHeight;
+      if (newW <= 0 || newH <= 0) return;
       camera.aspect = newW / newH;
       camera.updateProjectionMatrix();
       adjustCameraFraming();
@@ -1002,8 +1275,21 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
     window.addEventListener('resize', handleResize);
 
+    let resizeObserver: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined' && container) {
+      resizeObserver = new ResizeObserver(() => {
+        handleResize();
+      });
+      resizeObserver.observe(container);
+    }
+
     // 9. Pointer movement for gaze tracking & drag rotation (v1 rotational multiplier)
     const handlePointerMove = (e: PointerEvent) => {
+      if (!enablePointerTrackingRef.current) {
+        mouseRef.current = { x: 0, y: 0 };
+        return;
+      }
+
       const rect = container.getBoundingClientRect();
       const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
@@ -1018,7 +1304,7 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
 
     // 10. Pointer Down on 3D Model: Detect Body Region & initiate rotation drag
     const handlePointerDown = (e: PointerEvent) => {
-      if (!container || !cameraRef.current || !vrmRef.current) return;
+      if (!interactiveRef.current || !container || !cameraRef.current || !vrmRef.current) return;
       const rect = container.getBoundingClientRect();
       const x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
       const y = -(((e.clientY - rect.top) / rect.height) * 2 - 1);
@@ -1145,6 +1431,9 @@ export const VRMCanvas: React.FC<VRMCanvasProps> = ({
       cancelAnimationFrame(animationFrameId);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('resize', handleResize);
+      if (resizeObserver) {
+        resizeObserver.disconnect();
+      }
       window.removeEventListener('pointermove', handlePointerMove);
       container.removeEventListener('pointerdown', handlePointerDown);
       window.removeEventListener('pointerup', handlePointerUp);
