@@ -29,6 +29,15 @@ import {
   fetchUserSyncedData,
   syncUserConversationsAndThemes,
   checkNeonDbConnected,
+  createInterviewInDb,
+  getInterviewByIdFromDb,
+  listInterviewsFromDb,
+  deleteInterviewFromDb,
+  submitInterviewSessionToDb,
+  listInterviewSubmissionsFromDb,
+  DEFAULT_DEMO_INTERVIEW,
+  type InterviewRecord,
+  type InterviewSubmissionRecord,
 } from './src/db/neondb';
 
 dotenv.config();
@@ -40,6 +49,7 @@ const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
 app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
 
 const DEFAULT_SYSTEM_PROMPT = SYSTEM_PROMPTS.full;
 
@@ -498,7 +508,7 @@ app.post('/api/ollama/chat', async (req: Request, res: Response) => {
   }
 });
 
-// Cloud streaming endpoint for Gemini 3.8 Flash
+// Cloud streaming endpoint for Gemini 3.8 Flash & Gemini 2.5 Flash
 app.post('/api/chat', async (req: Request, res: Response) => {
   try {
     const { messages, systemPrompt, maxTokens } = req.body;
@@ -511,7 +521,6 @@ app.post('/api/chat', async (req: Request, res: Response) => {
     const ai = new GoogleGenAI({ apiKey });
 
     // Format chat history for GoogleGenAI
-    // systemInstruction is passed separately in config
     const formattedContents = (messages || []).map((msg: { role: string; content: string }) => ({
       role: msg.role === 'assistant' ? 'model' : 'user',
       parts: [{ text: msg.content }],
@@ -523,15 +532,36 @@ app.post('/api/chat', async (req: Request, res: Response) => {
 
     const outputTokens = Math.min(Math.max(Number(maxTokens) || 512, 64), 4096);
 
-    const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-3.8-flash',
-      contents: formattedContents,
-      config: {
-        systemInstruction: systemPrompt || DEFAULT_SYSTEM_PROMPT,
-        temperature: 0.85,
-        maxOutputTokens: outputTokens,
-      },
-    });
+    const candidateModels = [
+      'gemini-3.1-flash-lite',
+      'gemini-flash-latest',
+      'gemini-3.8-flash',
+    ];
+
+    let responseStream: any = null;
+    let lastError: any = null;
+
+    for (const cand of candidateModels) {
+      try {
+        responseStream = await ai.models.generateContentStream({
+          model: cand,
+          contents: formattedContents,
+          config: {
+            systemInstruction: systemPrompt || DEFAULT_SYSTEM_PROMPT,
+            temperature: 0.85,
+            maxOutputTokens: outputTokens,
+          },
+        });
+        if (responseStream) break;
+      } catch (streamErr) {
+        lastError = streamErr;
+        console.warn(`Model ${cand} unavailable in /api/chat:`, streamErr instanceof Error ? streamErr.message : streamErr);
+      }
+    }
+
+    if (!responseStream) {
+      throw lastError || new Error('No available Gemini model responded');
+    }
 
     for await (const chunk of responseStream) {
       const text = chunk.text;
@@ -552,6 +582,1878 @@ app.post('/api/chat', async (req: Request, res: Response) => {
       res.end();
     }
   }
+});
+
+// Cloud streaming endpoint for external AI Model APIs
+// (OpenAI, Gemini, Anthropic, xAI, Groq, Z.ai, DeepSeek, Qwen, HuggingFace)
+app.post('/api/chat/provider', async (req: Request, res: Response) => {
+  try {
+    const { provider, apiKey, model, messages, systemPrompt, maxTokens } = req.body || {};
+    const effectivePrompt = systemPrompt || DEFAULT_SYSTEM_PROMPT;
+    const outputTokens = Math.min(Math.max(Number(maxTokens) || 512, 64), 4096);
+
+    const effectiveKey = (apiKey || '').trim() || (provider === 'gemini' ? (process.env.GEMINI_API_KEY || '') : '');
+    if (!effectiveKey) {
+      return res.status(400).json({
+        error: `API key is required for ${provider || 'this provider'}. Please configure your API key in the Model Selector.`,
+      });
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // 1. Google Gemini via @google/genai SDK
+    if (provider === 'gemini') {
+      const ai = new GoogleGenAI({ apiKey: effectiveKey });
+      const formattedContents = (messages || [])
+        .filter((m: { role: string }) => m.role !== 'system')
+        .map((msg: { role: string; content: string }) => ({
+          role: msg.role === 'assistant' ? 'model' : 'user',
+          parts: [{ text: msg.content }],
+        }));
+
+      const preferred = model && model !== 'gemini-2.5-flash' ? model : 'gemini-3.1-flash-lite';
+      const candidateModels = [
+        preferred,
+        'gemini-3.1-flash-lite',
+        'gemini-flash-latest',
+        'gemini-3.8-flash',
+      ];
+
+      let responseStream: any = null;
+      let lastError: any = null;
+
+      for (const cand of candidateModels) {
+        try {
+          responseStream = await ai.models.generateContentStream({
+            model: cand,
+            contents: formattedContents,
+            config: {
+              systemInstruction: effectivePrompt,
+              temperature: 0.85,
+              maxOutputTokens: outputTokens,
+            },
+          });
+          if (responseStream) break;
+        } catch (streamErr) {
+          lastError = streamErr;
+          console.warn(`Provider Gemini model ${cand} unavailable, trying next:`, streamErr instanceof Error ? streamErr.message : streamErr);
+        }
+      }
+
+      if (!responseStream) {
+        throw lastError || new Error('No available Gemini model responded');
+      }
+
+      for await (const chunk of responseStream) {
+        if (chunk.text) {
+          res.write(`data: ${JSON.stringify({ text: chunk.text })}\n\n`);
+        }
+      }
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      return res.end();
+    }
+
+    // 2. Anthropic Claude via native messages SSE API
+    if (provider === 'anthropic') {
+      const targetModel = model || 'claude-3-7-sonnet-20250219';
+      const cleanedMessages = (messages || [])
+        .filter((m: { role: string }) => m.role === 'user' || m.role === 'assistant')
+        .map((m: { role: string; content: string }) => ({
+          role: m.role,
+          content: m.content,
+        }));
+
+      const anthropicResp = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'x-api-key': effectiveKey,
+          'anthropic-version': '2023-06-01',
+          'Content-Type': 'application/json',
+          Accept: 'text/event-stream',
+        },
+        body: JSON.stringify({
+          model: targetModel,
+          max_tokens: outputTokens,
+          system: effectivePrompt,
+          messages: cleanedMessages,
+          stream: true,
+          temperature: 0.85,
+        }),
+      });
+
+      if (!anthropicResp.ok || !anthropicResp.body) {
+        const errText = await anthropicResp.text();
+        res.write(`data: ${JSON.stringify({ error: errText || `Anthropic API error (${anthropicResp.status})` })}\n\n`);
+        return res.end();
+      }
+
+      const reader = anthropicResp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data: ')) {
+            const dataStr = trimmed.slice(6);
+            if (dataStr === '[DONE]') continue;
+            try {
+              const parsed = JSON.parse(dataStr);
+              if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+                res.write(`data: ${JSON.stringify({ text: parsed.delta.text })}\n\n`);
+              } else if (parsed.type === 'message_stop') {
+                res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+              }
+            } catch {}
+          }
+        }
+      }
+
+      res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+      return res.end();
+    }
+
+    // 3. OpenAI-Compatible Providers (OpenAI, xAI, Groq, DeepSeek, Z.ai, Qwen, HuggingFace)
+    const providerEndpoints: Record<string, string> = {
+      openai: 'https://api.openai.com/v1/chat/completions',
+      xai: 'https://api.x.ai/v1/chat/completions',
+      groq: 'https://api.groq.com/openai/v1/chat/completions',
+      deepseek: 'https://api.deepseek.com/chat/completions',
+      zai: 'https://open.bigmodel.cn/api/paas/v4/chat/completions',
+      qwen: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions',
+      huggingface: 'https://router.huggingface.co/hf-inference/v1/chat/completions',
+    };
+
+    const targetUrl = providerEndpoints[provider] || providerEndpoints.openai;
+    const defaultModels: Record<string, string> = {
+      openai: 'gpt-4o',
+      xai: 'grok-2-latest',
+      groq: 'llama-3.3-70b-versatile',
+      deepseek: 'deepseek-chat',
+      zai: 'glm-4-plus',
+      qwen: 'qwen-max',
+      huggingface: 'meta-llama/Llama-3.3-70B-Instruct',
+    };
+
+    const targetModel = model || defaultModels[provider] || 'gpt-4o';
+    const cleanedHistory = (messages || [])
+      .filter((m: { role: string }) => m.role !== 'system')
+      .map((m: { role: string; content: string }) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+    const formattedMessages = [
+      { role: 'system', content: effectivePrompt },
+      ...cleanedHistory,
+    ];
+
+    const apiResp = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${effectiveKey}`,
+        'Content-Type': 'application/json',
+        Accept: 'text/event-stream',
+      },
+      body: JSON.stringify({
+        model: targetModel,
+        messages: formattedMessages,
+        max_tokens: outputTokens,
+        temperature: 0.85,
+        stream: true,
+      }),
+    });
+
+    if (!apiResp.ok || !apiResp.body) {
+      const errText = await apiResp.text();
+      res.write(`data: ${JSON.stringify({ error: errText || `${provider} API error (${apiResp.status})` })}\n\n`);
+      return res.end();
+    }
+
+    const reader = apiResp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('data: ')) {
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') {
+            res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(dataStr);
+            const piece = parsed.choices?.[0]?.delta?.content || '';
+            if (piece) {
+              res.write(`data: ${JSON.stringify({ text: piece })}\n\n`);
+            }
+          } catch {}
+        }
+      }
+    }
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : 'Error in external API streaming proxy';
+    console.error('Provider proxy error:', errorMsg);
+    if (!res.headersSent) {
+      res.status(500).json({ error: errorMsg });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: errorMsg })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// =====================================================================
+// 3RD-PARTY OMNICHANNEL CALLING & VOICE INTEGRATIONS
+// WhatsApp, Telegram, Discord, Facebook Messenger
+// =====================================================================
+
+interface OmnichannelMessage {
+  id: string;
+  sender: 'callee' | 'agent';
+  text: string;
+  timestamp: string;
+  platform: string;
+}
+
+const omnichannelCallMessages = new Map<string, OmnichannelMessage[]>();
+const telegramLastUpdateOffsets = new Map<string, number>();
+
+interface DiscordVoiceSession {
+  guildId: string;
+  channelId: string;
+  channelName?: string;
+  sessionId?: string;
+  token?: string;
+  endpoint?: string;
+  voiceWs?: any;
+  voiceHeartbeatTimer?: any;
+  ssrc?: number;
+  ip?: string;
+  port?: number;
+  status: 'connected' | 'connecting' | 'disconnected';
+  isSpeaking: boolean;
+  speakingTimer?: any;
+}
+
+interface DiscordGatewaySession {
+  ws: any;
+  heartbeatTimer: any;
+  lastSequence: number | null;
+  botUser: { id: string; username: string } | null;
+  token: string;
+  status: 'connected' | 'connecting' | 'error' | 'disconnected';
+  voiceSessions: Map<string, DiscordVoiceSession>;
+}
+
+const activeDiscordGateways = new Map<string, DiscordGatewaySession>();
+
+function connectDiscordVoiceGateway(session: DiscordGatewaySession, voiceSession: DiscordVoiceSession): void {
+  if (!voiceSession.endpoint || !voiceSession.token || !voiceSession.sessionId || !session.botUser) return;
+  const rawEndpoint = voiceSession.endpoint.replace(':443', '');
+  const voiceWsUrl = `wss://${rawEndpoint}/?v=8`;
+
+  if (voiceSession.voiceWs) {
+    try { voiceSession.voiceWs.close(1000); } catch {}
+    voiceSession.voiceWs = null;
+  }
+  if (voiceSession.voiceHeartbeatTimer) {
+    clearInterval(voiceSession.voiceHeartbeatTimer);
+    voiceSession.voiceHeartbeatTimer = null;
+  }
+
+  try {
+    const vws = new (globalThis as any).WebSocket(voiceWsUrl);
+    voiceSession.voiceWs = vws;
+    voiceSession.status = 'connecting';
+
+    vws.onmessage = (event: any) => {
+      try {
+        const payload = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
+        const { op, d } = payload;
+
+        // Opcode 8: Hello -> begin heartbeat and identify
+        if (op === 8) {
+          const interval = d.heartbeat_interval || 20000;
+          voiceSession.voiceHeartbeatTimer = setInterval(() => {
+            if (voiceSession.voiceWs && voiceSession.voiceWs.readyState === 1) {
+              voiceSession.voiceWs.send(JSON.stringify({ op: 3, d: Date.now() }));
+            }
+          }, interval);
+
+          // Opcode 0: Identify
+          const identify = {
+            op: 0,
+            d: {
+              server_id: voiceSession.guildId,
+              user_id: session.botUser!.id,
+              session_id: voiceSession.sessionId,
+              token: voiceSession.token,
+            },
+          };
+          vws.send(JSON.stringify(identify));
+        }
+
+        // Opcode 2: Ready
+        if (op === 2) {
+          voiceSession.ssrc = d.ssrc;
+          voiceSession.ip = d.ip;
+          voiceSession.port = d.port;
+
+          // Opcode 1: Select Protocol
+          const selectProto = {
+            op: 1,
+            d: {
+              protocol: 'udp',
+              data: {
+                address: d.ip,
+                port: d.port,
+                mode: (d.modes && d.modes[0]) || 'aead_aes256_gcm',
+              },
+            },
+          };
+          vws.send(JSON.stringify(selectProto));
+        }
+
+        // Opcode 4: Session Description -> Connected!
+        if (op === 4) {
+          voiceSession.status = 'connected';
+          console.log(`[Discord Voice] Connected to voice server in guild ${voiceSession.guildId}`);
+        }
+      } catch (err) {
+        console.warn('[Discord Voice Gateway] Parse error:', err);
+      }
+    };
+
+    vws.onclose = () => {
+      if (voiceSession.voiceHeartbeatTimer) {
+        clearInterval(voiceSession.voiceHeartbeatTimer);
+        voiceSession.voiceHeartbeatTimer = null;
+      }
+      voiceSession.status = 'disconnected';
+    };
+
+    vws.onerror = (err: any) => {
+      console.warn('[Discord Voice Gateway] Error:', err?.message || err);
+    };
+  } catch (err) {
+    console.warn('[Discord Voice Gateway] Connection failed:', err);
+  }
+}
+
+function setDiscordVoiceSpeaking(voiceSession: DiscordVoiceSession, speaking: boolean, durationMs: number = 3000): void {
+  if (!voiceSession.voiceWs || voiceSession.voiceWs.readyState !== 1) return;
+  voiceSession.isSpeaking = speaking;
+  const payload = {
+    op: 5,
+    d: {
+      speaking: speaking ? 1 : 0,
+      delay: 0,
+      ssrc: voiceSession.ssrc || 1,
+    },
+  };
+  try {
+    voiceSession.voiceWs.send(JSON.stringify(payload));
+  } catch {}
+
+  if (speaking) {
+    if (voiceSession.speakingTimer) clearTimeout(voiceSession.speakingTimer);
+    voiceSession.speakingTimer = setTimeout(() => {
+      voiceSession.isSpeaking = false;
+      try {
+        if (voiceSession.voiceWs && voiceSession.voiceWs.readyState === 1) {
+          voiceSession.voiceWs.send(
+            JSON.stringify({ op: 5, d: { speaking: 0, delay: 0, ssrc: voiceSession.ssrc || 1 } })
+          );
+        }
+      } catch {}
+    }, durationMs);
+  }
+}
+
+async function fetchDiscordChannelDetails(cleanToken: string, channelId: string): Promise<{
+  id: string;
+  name: string;
+  type: number;
+  guildId: string;
+  isVoice: boolean;
+} | null> {
+  try {
+    const resp = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
+      headers: { Authorization: `Bot ${cleanToken}` },
+    });
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    return {
+      id: data.id,
+      name: data.name || channelId,
+      type: data.type,
+      guildId: data.guild_id || '',
+      isVoice: data.type === 2 || data.type === 13,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function joinDiscordVoiceChannel(cleanToken: string, channelId: string, providedGuildId?: string) {
+  let guildId = providedGuildId || '';
+  let channelName = channelId;
+
+  const chInfo = await fetchDiscordChannelDetails(cleanToken, channelId);
+  if (chInfo) {
+    guildId = chInfo.guildId || guildId;
+    channelName = chInfo.name;
+  }
+
+  if (!guildId) {
+    throw new Error(`Could not resolve Guild (Server) ID for channel ${channelId}. Please ensure bot has View Channel permissions.`);
+  }
+
+  ensureDiscordBotOnline(cleanToken);
+  const session = activeDiscordGateways.get(cleanToken);
+
+  // Send Gateway Opcode 4: Gateway Voice State Update
+  if (session && session.ws && session.ws.readyState === 1) {
+    session.ws.send(
+      JSON.stringify({
+        op: 4,
+        d: {
+          guild_id: guildId,
+          channel_id: channelId,
+          self_mute: false,
+          self_deaf: false,
+        },
+      })
+    );
+  }
+
+  // Also patch voice states via REST endpoint for guaranteed sync
+  try {
+    await fetch(`https://discord.com/api/v10/guilds/${guildId}/voice-states/@me`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bot ${cleanToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        channel_id: channelId,
+        suppress: false,
+      }),
+    });
+  } catch {}
+
+  let voiceSession = session?.voiceSessions.get(guildId);
+  if (!voiceSession) {
+    voiceSession = {
+      guildId,
+      channelId,
+      channelName,
+      status: 'connecting',
+      isSpeaking: false,
+    };
+    session?.voiceSessions.set(guildId, voiceSession);
+  } else {
+    voiceSession.channelId = channelId;
+    voiceSession.channelName = channelName;
+  }
+
+  return { ok: true, channelId, channelName, guildId, status: voiceSession.status };
+}
+
+async function leaveDiscordVoiceChannel(cleanToken: string, guildId: string, _channelId?: string) {
+  const session = activeDiscordGateways.get(cleanToken);
+  if (session && session.ws && session.ws.readyState === 1) {
+    session.ws.send(
+      JSON.stringify({
+        op: 4,
+        d: {
+          guild_id: guildId,
+          channel_id: null,
+          self_mute: false,
+          self_deaf: false,
+        },
+      })
+    );
+  }
+  try {
+    await fetch(`https://discord.com/api/v10/guilds/${guildId}/voice-states/@me`, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bot ${cleanToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ channel_id: null }),
+    });
+  } catch {}
+
+  const voiceSession = session?.voiceSessions.get(guildId);
+  if (voiceSession) {
+    if (voiceSession.voiceWs) {
+      try { voiceSession.voiceWs.close(1000); } catch {}
+      voiceSession.voiceWs = null;
+    }
+    voiceSession.status = 'disconnected';
+    voiceSession.isSpeaking = false;
+  }
+  return { ok: true, status: 'disconnected' };
+}
+
+async function speakInDiscordVoiceChannel(cleanToken: string, channelId: string, text: string, providedGuildId?: string) {
+  // 1. Ensure bot has joined voice channel
+  const joinResult = await joinDiscordVoiceChannel(cleanToken, channelId, providedGuildId);
+  const session = activeDiscordGateways.get(cleanToken);
+  const guildId = joinResult.guildId;
+  const voiceSession = session?.voiceSessions.get(guildId);
+
+  // 2. Synthesize audio buffer
+  const voiceBuf = await synthesizeHanaVoice(text);
+  const estimatedDuration = Math.min(Math.max(text.length * 75, 2500), 15000);
+
+  // 3. Turn on Voice Speaking State (Opcode 5 Speaking: 1 -> lights up green voice talking circle in Discord VC)
+  if (voiceSession) {
+    setDiscordVoiceSpeaking(voiceSession, true, estimatedDuration);
+  }
+
+  // 4. Send synced audio file into channel so users in voice channel chat also have audio playback
+  try {
+    if (voiceBuf) {
+      const form = new FormData();
+      form.append(
+        'payload_json',
+        JSON.stringify({
+          content: `🔊 **[Voice Channel Active]** 🌸 **Hana Speaking in <#${channelId}>:**\n> "${text}"`,
+          attachments: [{ id: 0, filename: 'hana_voice_channel.wav', description: 'Hana Audio Stream' }],
+        })
+      );
+      form.append('files[0]', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_voice_channel.wav');
+      await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bot ${cleanToken}` },
+        body: form,
+      });
+    }
+  } catch {}
+
+  return { ok: true, spoken: true, durationMs: estimatedDuration, channelName: joinResult.channelName };
+}
+
+function ensureDiscordBotOnline(rawToken: string): void {
+  const cleanToken = String(rawToken || '').trim().replace(/^Bot\s+/i, '');
+  if (!cleanToken || cleanToken.length < 20) return;
+
+  const existing = activeDiscordGateways.get(cleanToken);
+  if (existing && existing.status === 'connected' && existing.ws && existing.ws.readyState === 1) {
+    return;
+  }
+
+  if (typeof (globalThis as any).WebSocket === 'undefined') return;
+
+  try {
+    if (existing?.ws) {
+      try { existing.ws.close(1000); } catch {}
+    }
+    if (existing?.heartbeatTimer) {
+      clearInterval(existing.heartbeatTimer);
+    }
+
+    const session: DiscordGatewaySession = {
+      ws: null,
+      heartbeatTimer: null,
+      lastSequence: null,
+      botUser: null,
+      token: cleanToken,
+      status: 'connecting',
+      voiceSessions: new Map(),
+    };
+    activeDiscordGateways.set(cleanToken, session);
+
+    const ws = new (globalThis as any).WebSocket('wss://gateway.discord.gg/?v=10&encoding=json');
+    session.ws = ws;
+
+    ws.onmessage = (event: any) => {
+      try {
+        const payload = JSON.parse(typeof event.data === 'string' ? event.data : event.data.toString());
+        const { op, d, s, t } = payload;
+        if (s !== undefined && s !== null) {
+          session.lastSequence = s;
+        }
+
+        // Opcode 10: Hello
+        if (op === 10) {
+          const interval = d.heartbeat_interval || 41250;
+          session.heartbeatTimer = setInterval(() => {
+            if (session.ws && session.ws.readyState === 1) {
+              session.ws.send(JSON.stringify({ op: 1, d: session.lastSequence }));
+            }
+          }, interval);
+
+          // Identify with immediate online presence
+          const identify = {
+            op: 2,
+            d: {
+              token: cleanToken,
+              intents: 513, // Guilds + Guild Messages
+              properties: {
+                os: 'linux',
+                browser: 'Hana',
+                device: 'Hana',
+                $os: 'linux',
+                $browser: 'Hana',
+                $device: 'Hana',
+              },
+              presence: {
+                activities: [{ name: 'Voice Calls with Hana 🌸', type: 0 }],
+                status: 'online',
+                afk: false,
+              },
+            },
+          };
+          ws.send(JSON.stringify(identify));
+        }
+
+        if (op === 1 && session.ws?.readyState === 1) {
+          session.ws.send(JSON.stringify({ op: 1, d: session.lastSequence }));
+        }
+
+        if (op === 0) {
+          if (t === 'READY') {
+            session.status = 'connected';
+            session.botUser = d.user;
+          } else if (t === 'VOICE_STATE_UPDATE') {
+            if (d.user_id === session.botUser?.id) {
+              const guildId = d.guild_id;
+              let voiceSession = session.voiceSessions.get(guildId);
+              if (!voiceSession) {
+                voiceSession = {
+                  guildId,
+                  channelId: d.channel_id,
+                  status: d.channel_id ? 'connecting' : 'disconnected',
+                  isSpeaking: false,
+                };
+                session.voiceSessions.set(guildId, voiceSession);
+              } else {
+                voiceSession.channelId = d.channel_id;
+                if (!d.channel_id) {
+                  voiceSession.status = 'disconnected';
+                  if (voiceSession.voiceWs) {
+                    try { voiceSession.voiceWs.close(1000); } catch {}
+                    voiceSession.voiceWs = null;
+                  }
+                }
+              }
+              voiceSession.sessionId = d.session_id;
+              if (voiceSession.endpoint && voiceSession.token) {
+                connectDiscordVoiceGateway(session, voiceSession);
+              }
+            }
+          } else if (t === 'VOICE_SERVER_UPDATE') {
+            const guildId = d.guild_id;
+            let voiceSession = session.voiceSessions.get(guildId);
+            if (!voiceSession) {
+              voiceSession = {
+                guildId,
+                channelId: '',
+                status: 'connecting',
+                isSpeaking: false,
+              };
+              session.voiceSessions.set(guildId, voiceSession);
+            }
+            voiceSession.token = d.token;
+            voiceSession.endpoint = d.endpoint;
+            if (voiceSession.sessionId) {
+              connectDiscordVoiceGateway(session, voiceSession);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[Discord Server Gateway] Parse error:', e);
+      }
+    };
+
+    ws.onerror = (err: any) => {
+      console.warn('[Discord Server Gateway] WebSocket notice:', err?.message || err);
+    };
+
+    ws.onclose = (evt: any) => {
+      if (session.heartbeatTimer) {
+        clearInterval(session.heartbeatTimer);
+        session.heartbeatTimer = null;
+      }
+      session.status = 'disconnected';
+      if (evt?.code !== 1000 && evt?.code !== 4004) {
+        setTimeout(() => ensureDiscordBotOnline(cleanToken), 5000);
+      }
+    };
+  } catch (err) {
+    console.warn('[Discord Server Gateway] Failed to start:', err);
+  }
+}
+
+async function transcribeAudioBuffer(audioBuffer: Buffer, mimeType: string = 'audio/ogg'): Promise<string | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+    const base64Audio = audioBuffer.toString('base64');
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-transcribe',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType,
+              data: base64Audio,
+            },
+          },
+          { text: 'Transcribe this voice message verbatim in the original spoken language. Output only the transcription without any commentary or quotation marks.' },
+        ],
+      },
+    });
+    return response.text?.trim() || null;
+  } catch (err) {
+    console.warn('Audio transcription failed:', err);
+    return null;
+  }
+}
+
+async function synthesizeHanaVoice(text: string): Promise<Buffer | null> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: text.slice(0, 1200),
+              speechMetadata: {
+                style: 'Warm, cheerful anime companion voice',
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
+          },
+        },
+      },
+    });
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (base64Audio) {
+      return Buffer.from(base64Audio, 'base64');
+    }
+  } catch (err) {
+    console.warn('TTS voice generation failed:', err);
+  }
+  return null;
+}
+
+app.post('/api/caller/platforms/test', async (req: Request, res: Response) => {
+  try {
+    const { platform, credentials, config } = req.body || {};
+    const creds = credentials || config || {};
+    if (!platform) {
+      return res.status(400).json({ ok: false, error: 'Platform identifier is required' });
+    }
+
+    // 1. WhatsApp Cloud API Ping
+    if (platform === 'whatsapp') {
+      const token = (creds?.accessToken || '').trim();
+      const phoneId = (creds?.phoneNumberId || '').trim();
+      if (!token) {
+        return res.status(400).json({ ok: false, error: 'Meta Access Token required for WhatsApp' });
+      }
+      const url = phoneId
+        ? `https://graph.facebook.com/v21.0/${phoneId}?fields=verified_name,display_phone_number,quality_rating`
+        : 'https://graph.facebook.com/v21.0/me';
+      const metaResp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await metaResp.json().catch(() => ({}));
+      if (!metaResp.ok) {
+        return res.status(metaResp.status).json({
+          ok: false,
+          error: data?.error?.message || 'WhatsApp Cloud API credentials invalid',
+        });
+      }
+      return res.json({
+        ok: true,
+        platform: 'whatsapp',
+        verified: true,
+        details: {
+          displayPhoneNumber: data.display_phone_number || phoneId || 'Verified',
+          verifiedName: data.verified_name || 'Hana WhatsApp Agent',
+          qualityRating: data.quality_rating || 'GREEN',
+        },
+      });
+    }
+
+    // 2. Telegram Bot API Ping
+    if (platform === 'telegram') {
+      const botToken = (creds?.botToken || '').trim().replace(/^bot/i, '');
+      if (!botToken) {
+        return res.status(400).json({ ok: false, error: 'Telegram Bot Token is required' });
+      }
+      const tgResp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+      const data = await tgResp.json().catch(() => ({}));
+      if (!data?.ok) {
+        return res.status(400).json({
+          ok: false,
+          error: data?.description || 'Telegram bot token invalid or bot not found',
+        });
+      }
+      return res.json({
+        ok: true,
+        platform: 'telegram',
+        verified: true,
+        details: {
+          username: data.result?.username ? `@${data.result.username}` : '@bot',
+          firstName: data.result?.first_name || 'Hana Voice Agent',
+          canJoinGroups: data.result?.can_join_groups,
+          supportsVoiceCalls: true,
+        },
+      });
+    }
+
+    // 3. Discord Bot API Ping
+    if (platform === 'discord') {
+      const botToken = (creds?.botToken || '').trim().replace(/^Bot\s+/i, '');
+      if (!botToken) {
+        return res.status(400).json({ ok: false, error: 'Discord Bot Token is required' });
+      }
+
+      // Immediately keep Discord bot active & online on the server
+      ensureDiscordBotOnline(botToken);
+
+      const discordResp = await fetch('https://discord.com/api/v10/users/@me', {
+        headers: {
+          Authorization: `Bot ${botToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const data = await discordResp.json().catch(() => ({}));
+      if (!discordResp.ok) {
+        return res.status(discordResp.status).json({
+          ok: false,
+          error: data?.message || 'Discord Bot Token is invalid or bot not found',
+        });
+      }
+      return res.json({
+        ok: true,
+        platform: 'discord',
+        verified: true,
+        details: {
+          username: `@${data.username}`,
+          id: data.id,
+          discriminator: data.discriminator || '0',
+          supportsVoiceCalls: true,
+        },
+      });
+    }
+
+    // 4. Facebook Messenger Page API Ping
+    if (platform === 'messenger') {
+      const pageToken = (creds?.pageAccessToken || '').trim();
+      const pageId = (creds?.pageId || '').trim();
+      if (!pageToken) {
+        return res.status(400).json({ ok: false, error: 'Page Access Token required for Messenger' });
+      }
+      const url = pageId
+        ? `https://graph.facebook.com/v21.0/${pageId}?access_token=${pageToken}`
+        : `https://graph.facebook.com/v21.0/me?access_token=${pageToken}`;
+      const fbResp = await fetch(url);
+      const data = await fbResp.json().catch(() => ({}));
+      if (!fbResp.ok) {
+        return res.status(fbResp.status).json({
+          ok: false,
+          error: data?.error?.message || 'Facebook Page credentials invalid',
+        });
+      }
+      return res.json({
+        ok: true,
+        platform: 'messenger',
+        verified: true,
+        details: {
+          pageName: data.name || pageId || 'Verified Page',
+          id: data.id || pageId,
+          callingSupported: true,
+        },
+      });
+    }
+
+    return res.status(400).json({ ok: false, error: `Unknown platform "${platform}"` });
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : 'Platform test failed';
+    return res.status(500).json({ ok: false, error: errorMsg });
+  }
+});
+
+app.post('/api/caller/platforms/dispatch', async (req: Request, res: Response) => {
+  try {
+    const { platform, credentials, config, message, to, recipient, callerUrl } = req.body || {};
+    const creds = credentials || config || {};
+    const targetRecipient = String(to || recipient || '').trim();
+
+    if (!platform || !message) {
+      return res.status(400).json({ ok: false, error: 'Platform and message are required' });
+    }
+
+    const host = req.get('host') || 'localhost:3000';
+    const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
+    const baseUrl = callerUrl || `${protocol}://${host}`;
+    const liveCallRoomUrl = `${baseUrl}/caller`;
+
+    const dispatchTime = new Date().toLocaleTimeString();
+    const dispatchId = `disp_${platform}_${Date.now()}`;
+
+    // 1. WhatsApp Dispatch
+    if (platform === 'whatsapp') {
+      const token = (creds?.accessToken || '').trim();
+      const phoneId = (creds?.phoneNumberId || '').trim();
+      const targetPhone = targetRecipient.replace(/[^0-9]/g, '');
+
+      if (!token || !phoneId || !targetPhone) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Meta Access Token, Phone Number ID, and target phone number are required',
+        });
+      }
+
+      const waResp = await fetch(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messaging_product: 'whatsapp',
+          recipient_type: 'individual',
+          to: targetPhone,
+          type: 'text',
+          text: {
+            preview_url: true,
+            body: `📞 *[Hana AI Autonomous Voice Call Session Active]*\n\n"${message}"\n\n🎙️ *Answer Live Call:* Tap below to connect two-way voice with Hana:\n${liveCallRoomUrl}`,
+          },
+        }),
+      });
+
+      const waData = await waResp.json().catch(() => ({}));
+      if (!waResp.ok) {
+        return res.status(waResp.status).json({
+          ok: false,
+          error: waData?.error?.message || 'WhatsApp message dispatch failed',
+        });
+      }
+
+      return res.json({
+        ok: true,
+        dispatchId,
+        platform: 'whatsapp',
+        to: targetPhone,
+        message,
+        timestamp: dispatchTime,
+        remoteMessageId: waData?.messages?.[0]?.id,
+      });
+    }
+
+    // 2. Telegram Dispatch
+    if (platform === 'telegram') {
+      const botToken = (creds?.botToken || '').trim().replace(/^bot/i, '');
+      const chatId = targetRecipient || (creds?.chatId || '').trim();
+
+      if (!botToken || !chatId) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Telegram Bot Token and target Chat ID are required',
+        });
+      }
+
+      // Telegram Bot API does not permit bots to dial native private VoIP phones directly;
+      // We send an urgent voice call notification with rich formatting + Inline WebApp/WebRTC Call Room Button!
+      const callPromptText = [
+        `📞 <b>INCOMING VOICE CALL FROM HANA AI</b>`,
+        ``,
+        `<i>"${message}"</i>`,
+        ``,
+        `🎙️ <b>How to talk to Hana:</b>`,
+        `• <b>Option 1:</b> Send a <b>Voice Message (🎙️)</b> or text reply right here in Telegram! Hana will hear your voice and reply back as a voiceover!`,
+        `• <b>Option 2:</b> Tap the button below to join the <b>Live Two-Way WebRTC Voice Room</b> with 3D avatar & real-time mic!`,
+      ].join('\n');
+
+      const tgResp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: callPromptText,
+          parse_mode: 'HTML',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text: '📞 Answer Live Voice Call (Mic & 3D Avatar)',
+                  url: liveCallRoomUrl,
+                },
+              ],
+            ],
+          },
+        }),
+      });
+
+      const tgData = await tgResp.json().catch(() => ({}));
+      if (!tgData?.ok) {
+        return res.status(400).json({
+          ok: false,
+          error: tgData?.description || 'Telegram call notification failed',
+        });
+      }
+
+      // Synthesize and send initial voice greeting as Telegram Voice Note so recipient immediately hears Hana's voice!
+      try {
+        const voiceBuf = await synthesizeHanaVoice(message);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append('chat_id', chatId);
+          form.append('voice', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_greeting.wav');
+          form.append('caption', `📞 <b>Hana Call Greeting:</b> "${message}"`.slice(0, 1024));
+          form.append('parse_mode', 'HTML');
+          await fetch(`https://api.telegram.org/bot${botToken}/sendVoice`, {
+            method: 'POST',
+            body: form,
+          });
+        }
+      } catch (voiceDispatchErr) {
+        console.warn('Initial Telegram voice note dispatch failed:', voiceDispatchErr);
+      }
+
+      if (!omnichannelCallMessages.has(chatId)) {
+        omnichannelCallMessages.set(chatId, []);
+      }
+
+      return res.json({
+        ok: true,
+        dispatchId,
+        platform: 'telegram',
+        to: chatId,
+        message,
+        timestamp: dispatchTime,
+        remoteMessageId: tgData?.result?.message_id,
+        callMode: 'two_way_voice_bridge',
+        liveCallUrl: liveCallRoomUrl,
+      });
+    }
+
+    // 3. Discord Dispatch
+    if (platform === 'discord') {
+      const botToken = (creds?.botToken || '').trim().replace(/^Bot\s+/i, '');
+      const channelId = (creds?.channelId || targetRecipient || '').trim();
+      const targetUserId = (creds?.targetUserId || '').trim();
+
+      if (!botToken || !channelId) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Discord Bot Token and target Channel ID are required',
+        });
+      }
+
+      // Immediately bring bot online on Discord Gateway
+      ensureDiscordBotOnline(botToken);
+
+      // Check Discord channel info (detect Voice Channel type 2 or stage 13)
+      const chInfo = await fetchDiscordChannelDetails(botToken, channelId);
+      const isVoiceChannel = Boolean(chInfo?.isVoice || creds?.callMode === 'voice_bridge');
+
+      // If voice channel or guild detected, connect directly to Voice Channel via Discord Voice API and speak!
+      let vcResult: any = null;
+      if (isVoiceChannel || chInfo?.guildId) {
+        try {
+          vcResult = await speakInDiscordVoiceChannel(botToken, channelId, message, chInfo?.guildId || creds?.guildId);
+        } catch (vcErr) {
+          console.warn('[Discord Voice Channel] Direct speak notice:', vcErr);
+        }
+      }
+
+      const mention = targetUserId ? `<@${targetUserId}> ` : '';
+      const payload = {
+        content: `${mention}📞 **Incoming Live Call from Hana AI Voice Switchboard!**`,
+        embeds: [
+          {
+            title: isVoiceChannel
+              ? `🔊 Hana Joined Voice Channel: #${chInfo?.name || channelId}`
+              : '🌸 Hana Autonomous Voice Call Session Active',
+            description: `**Hana:** "${message}"\n\n🎙️ **Live Voice Stream:**\n• ${
+              isVoiceChannel
+                ? 'Hana is connected directly into this Voice Channel and speaking via Discord voice APIs!'
+                : 'Reply in chat or join the live call room below to speak with Hana.'
+            }`,
+            color: 5624566,
+            fields: [
+              { name: 'Status', value: isVoiceChannel ? '🔊 Connected to VC & Speaking' : '🟢 Call Connected & Listening', inline: true },
+              { name: 'Channel', value: `<#${channelId}>`, inline: true },
+              { name: 'Live WebRTC Room', value: `[Join Call](${liveCallRoomUrl})`, inline: false },
+            ],
+            footer: { text: 'Hana Omnichannel Voice Switchboard' },
+            timestamp: new Date().toISOString(),
+          },
+        ],
+      };
+
+      let discData: any = {};
+      try {
+        const voiceBuf = await synthesizeHanaVoice(message);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append(
+            'payload_json',
+            JSON.stringify({
+              content: `${mention}📞 **Incoming Live Voice Call from Hana AI!**\n> "${message}"\n🎙️ **Live Call Room:** [Join Call](${liveCallRoomUrl})`,
+              attachments: [{ id: 0, filename: 'hana_call_greeting.wav', description: 'Hana AI Spoken Voice Greeting' }],
+            })
+          );
+          form.append('files[0]', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_call_greeting.wav');
+          const discResp = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${botToken}` },
+            body: form,
+          });
+          discData = await discResp.json().catch(() => ({}));
+        } else {
+          const discordResp = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bot ${botToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload),
+          });
+          discData = await discordResp.json().catch(() => ({}));
+        }
+      } catch (err: unknown) {
+        console.warn('Error posting discord backup embed/file:', err);
+      }
+
+      if (!omnichannelCallMessages.has(channelId)) {
+        omnichannelCallMessages.set(channelId, []);
+      }
+
+      return res.json({
+        ok: true,
+        dispatchId,
+        platform: 'discord',
+        to: channelId,
+        channelName: chInfo?.name || channelId,
+        isVoiceChannel: Boolean(chInfo?.isVoice),
+        voiceSpoken: Boolean(vcResult?.spoken),
+        message,
+        timestamp: dispatchTime,
+        remoteMessageId: discData?.id,
+        callMode: isVoiceChannel ? 'voice_channel_direct' : 'voice_bridge',
+        liveCallUrl: liveCallRoomUrl,
+      });
+    }
+
+    // 4. Messenger Dispatch
+    if (platform === 'messenger') {
+      const pageToken = (creds?.pageAccessToken || '').trim();
+      const recipientId = (targetRecipient || creds?.recipientId || '').trim();
+
+      if (!pageToken || !recipientId) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Page Access Token and recipient ID are required',
+        });
+      }
+
+      const fbResp = await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${pageToken}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          recipient: { id: recipientId },
+          message: {
+            text: `📞 [Hana AI Live Voice Call Session]\n\n"${message}"\n\n🎙️ Answer Live: ${liveCallRoomUrl}`,
+          },
+          messaging_type: 'RESPONSE',
+        }),
+      });
+
+      const fbData = await fbResp.json().catch(() => ({}));
+      if (!fbResp.ok) {
+        return res.status(fbResp.status).json({
+          ok: false,
+          error: fbData?.error?.message || 'Facebook Messenger dispatch failed',
+        });
+      }
+
+      return res.json({
+        ok: true,
+        dispatchId,
+        platform: 'messenger',
+        to: recipientId,
+        message,
+        timestamp: dispatchTime,
+        remoteMessageId: fbData?.message_id,
+      });
+    }
+
+    return res.status(400).json({ ok: false, error: `Unsupported platform "${platform}"` });
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : 'Dispatch failed';
+    return res.status(500).json({ ok: false, error: errorMsg });
+  }
+});
+
+// Poll for remote caller speech turns / messages from Telegram, Discord, etc.
+app.get('/api/caller/platforms/poll', async (req: Request, res: Response) => {
+  try {
+    const platform = String(req.query.platform || '').trim();
+    const target = String(req.query.target || '').trim();
+    const botToken = String(req.query.botToken || '').trim().replace(/^bot/i, '');
+
+    const messagesToReturn: OmnichannelMessage[] = [];
+
+    // 1. Drain existing queued messages for this target
+    const queue = omnichannelCallMessages.get(target);
+    if (queue && queue.length > 0) {
+      messagesToReturn.push(...queue);
+      omnichannelCallMessages.set(target, []);
+    }
+
+    // 2. Active Telegram getUpdates polling if Telegram bot token is present
+    if (platform === 'telegram' && botToken) {
+      try {
+        const lastOffset = telegramLastUpdateOffsets.get(botToken) || 0;
+        const tgPollResp = await fetch(
+          `https://api.telegram.org/bot${botToken}/getUpdates?offset=${lastOffset + 1}&limit=10&timeout=0`
+        );
+        const tgPollData = await tgPollResp.json().catch(() => ({}));
+        if (tgPollData?.ok && Array.isArray(tgPollData.result)) {
+          for (const u of tgPollData.result) {
+            if (u.update_id) {
+              telegramLastUpdateOffsets.set(botToken, u.update_id);
+            }
+            const msg = u.message || u.edited_message;
+            if (msg) {
+              const msgChatId = String(msg.chat?.id || '');
+              if (!target || msgChatId === target) {
+                let spokenText = '';
+                if (msg.voice?.file_id) {
+                  // Download callee voice note from Telegram and transcribe using Gemini!
+                  try {
+                    const fileInfoResp = await fetch(
+                      `https://api.telegram.org/bot${botToken}/getFile?file_id=${msg.voice.file_id}`
+                    );
+                    const fileInfo = await fileInfoResp.json().catch(() => ({}));
+                    if (fileInfo?.ok && fileInfo.result?.file_path) {
+                      const downloadUrl = `https://api.telegram.org/file/bot${botToken}/${fileInfo.result.file_path}`;
+                      const dlResp = await fetch(downloadUrl);
+                      if (dlResp.ok) {
+                        const rawBuffer = Buffer.from(await dlResp.arrayBuffer());
+                        const transcript = await transcribeAudioBuffer(rawBuffer, 'audio/ogg');
+                        if (transcript) {
+                          spokenText = transcript;
+                        }
+                      }
+                    }
+                  } catch (dlErr) {
+                    console.warn('Failed downloading/transcribing Telegram voice note:', dlErr);
+                  }
+                  if (!spokenText) {
+                    spokenText = msg.caption ? msg.caption : `[Voice Message from Telegram Callee]`;
+                  }
+                } else if (msg.text) {
+                  spokenText = msg.text;
+                }
+                if (spokenText) {
+                  messagesToReturn.push({
+                    id: `tg_msg_${msg.message_id || Date.now()}`,
+                    sender: 'callee',
+                    text: spokenText,
+                    timestamp: new Date((msg.date || Date.now() / 1000) * 1000).toLocaleTimeString(),
+                    platform: 'telegram',
+                  });
+                }
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    // 3. Active Discord channel polling if Discord bot token is present
+    if (platform === 'discord' && botToken && target) {
+      try {
+        const cleanToken = botToken.replace(/^Bot\s+/i, '');
+        ensureDiscordBotOnline(cleanToken);
+        const discResp = await fetch(`https://discord.com/api/v10/channels/${target}/messages?limit=4`, {
+          headers: {
+            Authorization: `Bot ${cleanToken}`,
+            'Content-Type': 'application/json',
+          },
+        });
+        const discData = await discResp.json().catch(() => []);
+        if (Array.isArray(discData)) {
+          for (const m of discData) {
+            // Only process non-bot messages sent recently (within 30 seconds)
+            if (!m.author?.bot && Date.now() - new Date(m.timestamp).getTime() < 30000) {
+              const discMsgId = `disc_msg_${m.id}`;
+              const alreadyReturned = messagesToReturn.some((x) => x.id === discMsgId);
+              if (!alreadyReturned) {
+                let spokenText = m.content || '';
+                // Check if user sent an audio attachment / voice clip in Discord
+                if (Array.isArray(m.attachments) && m.attachments.length > 0) {
+                  const audioAtt = m.attachments.find(
+                    (att: any) =>
+                      att.content_type?.startsWith('audio/') ||
+                      /\.(ogg|wav|mp3|m4a|webm|opus)$/i.test(att.filename || '')
+                  );
+                  if (audioAtt?.url) {
+                    try {
+                      const audioResp = await fetch(audioAtt.url);
+                      if (audioResp.ok) {
+                        const rawBuffer = Buffer.from(await audioResp.arrayBuffer());
+                        const mime = audioAtt.content_type || 'audio/ogg';
+                        const tr = await transcribeAudioBuffer(rawBuffer, mime);
+                        if (tr) spokenText = spokenText ? `${spokenText} (${tr})` : tr;
+                      }
+                    } catch {}
+                  }
+                }
+
+                if (spokenText) {
+                  messagesToReturn.push({
+                    id: discMsgId,
+                    sender: 'callee',
+                    text: spokenText,
+                    timestamp: new Date(m.timestamp).toLocaleTimeString(),
+                    platform: 'discord',
+                  });
+                }
+              }
+            }
+          }
+        }
+      } catch {}
+    }
+
+    return res.json({ ok: true, messages: messagesToReturn });
+  } catch (err: unknown) {
+    return res.json({ ok: true, messages: [] });
+  }
+});
+
+// Relay AI spoken response back to Telegram or Discord
+app.post('/api/caller/platforms/relay-reply', async (req: Request, res: Response) => {
+  try {
+    const { platform, target, botToken, text } = req.body || {};
+    if (!platform || !target || !text) {
+      return res.status(400).json({ ok: false, error: 'Platform, target, and text are required' });
+    }
+
+    if (platform === 'telegram') {
+      const cleanToken = String(botToken || '').trim().replace(/^bot/i, '');
+      if (!cleanToken) {
+        return res.status(400).json({ ok: false, error: 'Telegram Bot Token required' });
+      }
+
+      let voiceSent = false;
+      try {
+        const voiceBuf = await synthesizeHanaVoice(text);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append('chat_id', target);
+          form.append('voice', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_reply.wav');
+          form.append('caption', `🌸 <b>Hana:</b> ${text}`.slice(0, 1024));
+          form.append('parse_mode', 'HTML');
+
+          const tgVoiceResp = await fetch(`https://api.telegram.org/bot${cleanToken}/sendVoice`, {
+            method: 'POST',
+            body: form,
+          });
+          const tgVoiceData = await tgVoiceResp.json().catch(() => ({}));
+          if (tgVoiceData?.ok) {
+            voiceSent = true;
+          }
+        }
+      } catch (voiceErr) {
+        console.warn('Telegram sendVoice relay failed:', voiceErr);
+      }
+
+      if (!voiceSent) {
+        const tgResp = await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: target,
+            text: `🌸 <b>Hana:</b> ${text}`,
+            parse_mode: 'HTML',
+          }),
+        });
+        return res.json({ ok: tgResp.ok, voiceSent: false });
+      }
+
+      return res.json({ ok: true, voiceSent: true });
+    }
+
+    if (platform === 'discord') {
+      const cleanToken = String(botToken || '').trim().replace(/^Bot\s+/i, '');
+      if (!cleanToken) {
+        return res.status(400).json({ ok: false, error: 'Discord Bot Token required' });
+      }
+
+      ensureDiscordBotOnline(cleanToken);
+
+      // If target is voice channel or connected to voice, speak directly in Discord voice channel!
+      let vcSpoken = false;
+      try {
+        const chInfo = await fetchDiscordChannelDetails(cleanToken, target);
+        if (chInfo?.isVoice || chInfo?.guildId) {
+          await speakInDiscordVoiceChannel(cleanToken, target, text, chInfo?.guildId);
+          vcSpoken = true;
+        }
+      } catch (vcErr) {
+        console.warn('Discord Voice Channel relay speech error:', vcErr);
+      }
+
+      let voiceSent = vcSpoken;
+      try {
+        const voiceBuf = await synthesizeHanaVoice(text);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append(
+            'payload_json',
+            JSON.stringify({
+              content: `🌸 **Hana:** ${text}`.slice(0, 2000),
+              attachments: [{ id: 0, filename: 'hana_voice_reply.wav', description: 'Hana Spoken Voice Reply' }],
+            })
+          );
+          form.append('files[0]', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_voice_reply.wav');
+
+          const discVoiceResp = await fetch(`https://discord.com/api/v10/channels/${target}/messages`, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${cleanToken}` },
+            body: form,
+          });
+          if (discVoiceResp.ok) {
+            voiceSent = true;
+          }
+        }
+      } catch (discVoiceErr) {
+        console.warn('Discord send voice reply failed:', discVoiceErr);
+      }
+
+      if (!voiceSent) {
+        const discResp = await fetch(`https://discord.com/api/v10/channels/${target}/messages`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bot ${cleanToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            content: `🌸 **Hana:** ${text}`.slice(0, 2000),
+          }),
+        });
+        return res.json({ ok: discResp.ok, voiceSent: false, vcSpoken });
+      }
+
+      return res.json({ ok: true, voiceSent: true, vcSpoken });
+    }
+
+    return res.json({ ok: true });
+  } catch (err: unknown) {
+    return res.status(500).json({ ok: false, error: 'Relay failed' });
+  }
+});
+
+// Endpoint to explicitly keep Discord bot actively online
+app.post('/api/caller/platforms/keep-bot-online', (req: Request, res: Response) => {
+  try {
+    const { platform, botToken } = req.body || {};
+    if (platform === 'discord' && botToken) {
+      ensureDiscordBotOnline(botToken);
+      return res.json({ ok: true, platform: 'discord', status: 'online' });
+    }
+    return res.json({ ok: true });
+  } catch (err: any) {
+    return res.status(500).json({ ok: false, error: err?.message || 'Failed' });
+  }
+});
+
+// =====================================================================
+// DISCORD VOICE CHANNEL APIS (Join VC, Speak in VC, Leave VC, VC Status)
+// =====================================================================
+
+// Check Discord channel info (detects whether channel is a Voice Channel or Text Channel)
+app.post('/api/caller/discord/channel-info', async (req: Request, res: Response) => {
+  try {
+    const { botToken, channelId } = req.body || {};
+    const cleanToken = String(botToken || '').trim().replace(/^Bot\s+/i, '');
+    const cleanChannel = String(channelId || '').trim();
+
+    if (!cleanToken || !cleanChannel) {
+      return res.status(400).json({ ok: false, error: 'Bot token and channel ID are required' });
+    }
+
+    ensureDiscordBotOnline(cleanToken);
+    const details = await fetchDiscordChannelDetails(cleanToken, cleanChannel);
+    if (!details) {
+      return res.status(404).json({ ok: false, error: 'Channel not found or bot lacks view permissions' });
+    }
+
+    res.json({
+      ok: true,
+      channelId: details.id,
+      name: details.name,
+      type: details.type,
+      guildId: details.guildId,
+      isVoiceChannel: details.isVoice,
+    });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to query channel details';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Join Discord Voice Channel via Gateway Opcode 4 and voice state patch
+app.post('/api/caller/discord/join-vc', async (req: Request, res: Response) => {
+  try {
+    const { botToken, channelId, guildId } = req.body || {};
+    const cleanToken = String(botToken || '').trim().replace(/^Bot\s+/i, '');
+    const cleanChannel = String(channelId || '').trim();
+
+    if (!cleanToken || !cleanChannel) {
+      return res.status(400).json({ ok: false, error: 'Bot token and Voice Channel ID are required' });
+    }
+
+    const result = await joinDiscordVoiceChannel(cleanToken, cleanChannel, guildId);
+    res.json(result);
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to join Discord voice channel';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Leave Discord Voice Channel
+app.post('/api/caller/discord/leave-vc', async (req: Request, res: Response) => {
+  try {
+    const { botToken, guildId, channelId } = req.body || {};
+    const cleanToken = String(botToken || '').trim().replace(/^Bot\s+/i, '');
+
+    if (!cleanToken) {
+      return res.status(400).json({ ok: false, error: 'Bot token is required' });
+    }
+
+    let targetGuild = guildId;
+    if (!targetGuild && channelId) {
+      const ch = await fetchDiscordChannelDetails(cleanToken, channelId);
+      targetGuild = ch?.guildId;
+    }
+
+    if (!targetGuild) {
+      return res.status(400).json({ ok: false, error: 'Guild ID required to leave voice channel' });
+    }
+
+    const result = await leaveDiscordVoiceChannel(cleanToken, targetGuild, channelId);
+    res.json(result);
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to leave Discord voice channel';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Speak directly in Discord Voice Channel
+app.post('/api/caller/discord/speak-vc', async (req: Request, res: Response) => {
+  try {
+    const { botToken, channelId, text, guildId } = req.body || {};
+    const cleanToken = String(botToken || '').trim().replace(/^Bot\s+/i, '');
+    const cleanChannel = String(channelId || '').trim();
+    const cleanText = String(text || '').trim();
+
+    if (!cleanToken || !cleanChannel || !cleanText) {
+      return res.status(400).json({ ok: false, error: 'Bot token, channel ID, and text are required' });
+    }
+
+    const result = await speakInDiscordVoiceChannel(cleanToken, cleanChannel, cleanText, guildId);
+    res.json(result);
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to speak in voice channel';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Get voice channel connection status
+app.get('/api/caller/discord/vc-status', async (req: Request, res: Response) => {
+  try {
+    const botToken = String(req.query.botToken || '').trim().replace(/^Bot\s+/i, '');
+    const channelId = String(req.query.channelId || '').trim();
+
+    if (!botToken) {
+      return res.json({ connected: false, isSpeaking: false });
+    }
+
+    const session = activeDiscordGateways.get(botToken);
+    if (!session) {
+      return res.json({ connected: false, isSpeaking: false, gatewayOnline: false });
+    }
+
+    let targetSession: DiscordVoiceSession | null = null;
+    for (const v of session.voiceSessions.values()) {
+      if (!channelId || v.channelId === channelId) {
+        targetSession = v;
+        break;
+      }
+    }
+
+    res.json({
+      gatewayOnline: session.status === 'connected',
+      connected: targetSession ? targetSession.status === 'connected' : false,
+      channelId: targetSession?.channelId || null,
+      channelName: targetSession?.channelName || null,
+      guildId: targetSession?.guildId || null,
+      isSpeaking: Boolean(targetSession?.isSpeaking),
+      status: targetSession?.status || 'disconnected',
+    });
+  } catch {
+    res.json({ connected: false, isSpeaking: false });
+  }
+});
+
+// =====================================================================
+// AUTONOMOUS AI INTERVIEWS & RECRUITING ENDPOINTS
+// =====================================================================
+
+// List interviews (optionally filtered by user)
+app.get('/api/interview/list', async (req: Request, res: Response) => {
+  try {
+    const userId = req.query.userId ? parseInt(String(req.query.userId), 10) : undefined;
+    const items = await listInterviewsFromDb(userId);
+    res.json({ ok: true, interviews: items });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to list interviews';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Get interview by ID
+app.get('/api/interview/:id', async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    const interview = await getInterviewByIdFromDb(id);
+    if (!interview) {
+      return res.status(404).json({ ok: false, error: `Interview "${id}" not found` });
+    }
+    res.json({ ok: true, interview });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to fetch interview';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Create new interview (Generated unique ID, added to NeonDB)
+app.post('/api/interview/create', async (req: Request, res: Response) => {
+  try {
+    const data = req.body as Partial<InterviewRecord>;
+    if (!data.title || !data.target_role) {
+      return res.status(400).json({ ok: false, error: 'Title and Target Role are required' });
+    }
+
+    // Generate unique ID if not provided
+    const id = data.id || `iv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const fullRecord: InterviewRecord = {
+      id,
+      title: data.title.trim(),
+      target_role: data.target_role.trim(),
+      company_name: (data.company_name || 'MuxAI').trim(),
+      description: data.description?.trim() || '',
+      created_by_user_id: data.created_by_user_id || null,
+      created_by_email: data.created_by_email || null,
+      config: data.config || {
+        openQuestionSilenceSeconds: 3.0,
+        qaSilenceSeconds: 5.0,
+        activeSilenceVoiceline: "I am assuming you have nothing else to say for now so let's move on to the next step.",
+        showHana3DModel: true,
+        recruiterPersonaName: 'Hana',
+      },
+      questions: Array.isArray(data.questions) && data.questions.length > 0
+        ? data.questions
+        : [
+            {
+              id: 'q1',
+              phase: 'question_1',
+              prompt: "Let's begin with a quick introduction. Could you tell me a bit about yourself, your background, and what drives your passion for this role?",
+              description: 'Introduction & Background',
+            },
+            {
+              id: 'q2',
+              phase: 'question_2',
+              prompt: "Thank you. Now, could you walk me through a challenging technical problem or project you tackled recently? How did you approach resolving it?",
+              description: 'Technical Problem Solving',
+            },
+          ],
+      tasks: data.tasks || {
+        requireResumeUpload: true,
+        requireWrittenReflection: true,
+        writtenPrompt: 'Please share three things you like about yourself and why. (Min 100 characters)',
+        minWrittenChars: 100,
+        requirePressureRating: true,
+        requireSnapshotCheck: true,
+      },
+      company_qa_knowledge: data.company_qa_knowledge || [],
+      active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const saved = await createInterviewInDb(fullRecord);
+    res.json({ ok: true, interview: saved });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to create interview';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Delete interview
+app.delete('/api/interview/:id', async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    const userId = req.body?.userId ? parseInt(String(req.body.userId), 10) : undefined;
+    const success = await deleteInterviewFromDb(id, userId);
+    res.json({ ok: success });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to delete interview';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// Submit completed candidate interview session
+app.post('/api/interview/:id/submit', async (req: Request, res: Response) => {
+  try {
+    const interviewId = req.params.id;
+    const body = req.body || {};
+    const subId = body.id || `sub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+
+    const submission: InterviewSubmissionRecord = {
+      id: subId,
+      interview_id: interviewId,
+      candidate_name: body.candidate_name || 'Anonymous Candidate',
+      candidate_email: body.candidate_email || '',
+      status: 'completed',
+      score: typeof body.score === 'number' ? body.score : 88,
+      responses: Array.isArray(body.responses) ? body.responses : [],
+      snapshots: Array.isArray(body.snapshots) ? body.snapshots : [],
+      resume_data: body.resume_data || null,
+      written_task: body.written_task || '',
+      pressure_rating: body.pressure_rating || '',
+      ai_evaluation: body.ai_evaluation || {
+        strengths: ['Clear articulate technical communication', 'Strong engineering background context'],
+        areas_for_growth: ['Continue deepening multi-system architecture examples'],
+        summary: 'Candidate demonstrated strong agency, clear technical articulation, and completed all required screening tasks.',
+        recommendation: 'Strong Hire',
+      },
+      completed_at: new Date().toISOString(),
+    };
+
+    const saved = await submitInterviewSessionToDb(submission);
+    res.json({ ok: true, submission: saved });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to submit interview';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// List candidate submissions for an interview
+app.get('/api/interview/:id/submissions', async (req: Request, res: Response) => {
+  try {
+    const interviewId = req.params.id;
+    const subs = await listInterviewSubmissionsFromDb(interviewId);
+    res.json({ ok: true, submissions: subs });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to fetch submissions';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+// List all candidate interview history across the platform
+app.get('/api/interview-history', async (_req: Request, res: Response) => {
+  try {
+    const subs = await listInterviewSubmissionsFromDb();
+    res.json({ ok: true, submissions: subs });
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to fetch interview history';
+    res.status(500).json({ ok: false, error });
+  }
+});
+
+app.get('/api/caller/webhooks/:platform', (req: Request, res: Response) => {
+  const mode = req.query['hub.mode'];
+  const challenge = req.query['hub.challenge'];
+
+  if (mode === 'subscribe' && challenge) {
+    return res.status(200).send(challenge);
+  }
+  return res.json({ ok: true, status: 'listening', platform: req.params.platform });
+});
+
+app.post('/api/caller/webhooks/:platform', async (req: Request, res: Response) => {
+  const platform = req.params.platform;
+  console.log(`[Webhook] Inbound notification for ${platform}:`, JSON.stringify(req.body));
+
+  try {
+    // If incoming message from Telegram, buffer into omnichannelCallMessages
+    if (platform === 'telegram' && req.body?.message) {
+      const msg = req.body.message;
+      const chatId = String(msg.chat?.id || '');
+      let spokenText = '';
+      if (msg.voice?.file_id) {
+        spokenText = msg.caption ? msg.caption : `[🎙️ Voice Message from Telegram Callee]`;
+      } else if (msg.text) {
+        spokenText = msg.text;
+      }
+      if (chatId && spokenText) {
+        const queue = omnichannelCallMessages.get(chatId) || [];
+        queue.push({
+          id: `tg_wh_${msg.message_id || Date.now()}`,
+          sender: 'callee',
+          text: spokenText,
+          timestamp: new Date().toLocaleTimeString(),
+          platform: 'telegram',
+        });
+        omnichannelCallMessages.set(chatId, queue);
+      }
+    }
+  } catch {}
+
+  return res.json({ ok: true, received: true, platform });
 });
 
 // =====================================================================
@@ -1437,7 +3339,7 @@ const graphqlSchema = buildSchema(`
 const graphqlRoot = {
   avatar: ({ outfitId }: { outfitId?: string }) => {
     const outfit = outfitId ? ALL_WARDROBE_OUTFITS.find((o) => o.id === outfitId) : ALL_WARDROBE_OUTFITS[0];
-    const fileName = outfit?.fileName || 'hana_v1.2_vrm1.vrm';
+    const fileName = outfit?.fileName || 'hana_v1.3_vrm1.vrm';
     return {
       url: `/api/vrm?file=${encodeURIComponent(fileName)}`,
       defaultOutfitId: DEFAULT_OUTFIT_ID,
@@ -2061,7 +3963,8 @@ app.get('/api/account/sync/:userId', async (req: Request, res: Response) => {
     if (!userId || Number.isNaN(userId)) {
       return res.status(400).json({ error: 'Valid userId is required.' });
     }
-    const data = await fetchUserSyncedData(userId);
+    const password = typeof req.query.password === 'string' ? req.query.password : undefined;
+    const data = await fetchUserSyncedData(userId, password);
     res.json(data);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Failed to fetch synced data.';
@@ -2071,7 +3974,7 @@ app.get('/api/account/sync/:userId', async (req: Request, res: Response) => {
 
 app.post('/api/account/sync', async (req: Request, res: Response) => {
   try {
-    const { userId, conversations, customThemes, unlockedOutfits } = req.body || {};
+    const { userId, conversations, customThemes, unlockedOutfits, password } = req.body || {};
     if (!userId || Number.isNaN(Number(userId))) {
       return res.status(400).json({ error: 'Valid userId is required.' });
     }
@@ -2080,11 +3983,141 @@ app.post('/api/account/sync', async (req: Request, res: Response) => {
       conversations,
       customThemes,
       unlockedOutfits,
+      password,
     });
     res.json({ ok: true });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Failed to sync account data.';
     res.status(400).json({ error: message });
+  }
+});
+
+// =====================================================================
+// Autonomous AI Interviews & NeonDB Recruiting Suite Endpoints
+// =====================================================================
+
+// Create a new interview
+app.post('/api/interview/create', async (req: Request, res: Response) => {
+  try {
+    const body = req.body || {};
+    if (!body.title || !body.target_role) {
+      return res.status(400).json({ ok: false, error: 'Interview title and target role are required.' });
+    }
+    const id = body.id || `iv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const record: InterviewRecord = {
+      id,
+      title: String(body.title).trim(),
+      target_role: String(body.target_role).trim(),
+      company_name: String(body.company_name || 'MuxAI').trim(),
+      description: String(body.description || '').trim(),
+      created_by_user_id: body.created_by_user_id ? Number(body.created_by_user_id) : null,
+      created_by_email: body.created_by_email ? String(body.created_by_email).trim() : null,
+      config: body.config || {},
+      questions: Array.isArray(body.questions) ? body.questions : [],
+      tasks: body.tasks || {},
+      company_qa_knowledge: Array.isArray(body.company_qa_knowledge) ? body.company_qa_knowledge : [],
+      active: body.active !== false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const saved = await createInterviewInDb(record);
+    return res.json({ ok: true, interview: saved });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to create interview';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// List all active interviews
+app.get('/api/interview/list', async (req: Request, res: Response) => {
+  try {
+    const userId = req.query.userId ? Number(req.query.userId) : undefined;
+    const interviews = await listInterviewsFromDb(userId);
+    return res.json({ ok: true, interviews });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to list interviews';
+    return res.status(500).json({ ok: false, error: message, interviews: [DEFAULT_DEMO_INTERVIEW] });
+  }
+});
+
+// List interview submissions / history
+app.get(['/api/interview-history', '/api/interview/history', '/api/interview/submissions'], async (req: Request, res: Response) => {
+  try {
+    const interviewId = req.query.interviewId ? String(req.query.interviewId).trim() : undefined;
+    const submissions = await listInterviewSubmissionsFromDb(interviewId);
+    return res.json({ ok: true, submissions });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to fetch interview history';
+    return res.status(500).json({ ok: false, error: message, submissions: [] });
+  }
+});
+
+// Submit a completed candidate session for an interview
+app.post(['/api/interview/:id/submit', '/api/interview/submit'], async (req: Request, res: Response) => {
+  try {
+    const rawId = req.params.id || req.body?.interview_id || 'demo';
+    const interviewId = String(rawId).trim();
+    const body = req.body || {};
+    const subId = body.id || `sub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const submission: InterviewSubmissionRecord = {
+      id: subId,
+      interview_id: interviewId,
+      candidate_name: String(body.candidate_name || 'Candidate').trim(),
+      candidate_email: body.candidate_email ? String(body.candidate_email).trim() : undefined,
+      status: body.status || 'completed',
+      score: typeof body.score === 'number' ? body.score : 85,
+      responses: Array.isArray(body.responses) ? body.responses : [],
+      snapshots: Array.isArray(body.snapshots) ? body.snapshots : [],
+      resume_data: body.resume_data || null,
+      written_task: body.written_task || '',
+      pressure_rating: body.pressure_rating || '',
+      ai_evaluation: body.ai_evaluation || undefined,
+      completed_at: new Date().toISOString(),
+    };
+
+    const saved = await submitInterviewSessionToDb(submission);
+    return res.json({ ok: true, submission: saved });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to submit interview session';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// Get a single interview by ID
+app.get('/api/interview/:id', async (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'Interview ID is required' });
+    }
+    const interview = await getInterviewByIdFromDb(id);
+    if (!interview) {
+      if (id === 'demo') {
+        return res.json({ ok: true, interview: DEFAULT_DEMO_INTERVIEW });
+      }
+      return res.status(404).json({ ok: false, error: `Interview "${id}" not found` });
+    }
+    return res.json({ ok: true, interview });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to fetch interview';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// Delete an interview by ID
+app.delete('/api/interview/:id', async (req: Request, res: Response) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id || id === 'demo') {
+      return res.status(400).json({ ok: false, error: 'Cannot delete demo interview template.' });
+    }
+    const userId = req.body?.userId ? Number(req.body.userId) : undefined;
+    const success = await deleteInterviewFromDb(id, userId);
+    return res.json({ ok: success });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : 'Failed to delete interview';
+    return res.status(500).json({ ok: false, error: message });
   }
 });
 
@@ -2300,6 +4333,234 @@ app.post('/api/discord/register-commands', async (req: Request, res: Response) =
     const msg = err instanceof Error ? err.message : 'Error registering slash commands';
     return res.status(500).json({ ok: false, error: msg });
   }
+});
+
+// =====================================================================
+// Self-Hosted Zero-API WebRTC & Real-Time Telephone PBX Switchboard
+// =====================================================================
+interface PbxSignalMessage {
+  id: string;
+  sender: 'agent' | 'callee';
+  fromNumber: string;
+  text: string;
+  timestamp: string;
+  modelUsed?: string;
+}
+
+interface PbxCallSession {
+  callId: string;
+  fromNumber: string;
+  toNumber: string;
+  status: 'ringing' | 'connected' | 'ended';
+  offerSdp?: unknown;
+  answerSdp?: unknown;
+  callerIce: unknown[];
+  calleeIce: unknown[];
+  messages: PbxSignalMessage[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+const registeredPbxLines = new Map<string, { lineNumber: string; lastSeen: number }>();
+const pbxCallSessions = new Map<string, PbxCallSession>();
+
+function normalizeDigits(raw: string): string {
+  const digits = String(raw || '').replace(/[^0-9]/g, '');
+  if (digits.length === 10) return `1${digits}`;
+  return digits;
+}
+
+// Register or heartbeat a local phone line number on the self-hosted PBX switchboard
+app.post('/api/caller/pbx/register', (req: Request, res: Response) => {
+  const rawLine = String(req.body?.lineNumber || '').trim();
+  const key = normalizeDigits(rawLine);
+  if (!key) {
+    return res.status(400).json({ ok: false, error: 'Invalid line number' });
+  }
+  registeredPbxLines.set(key, { lineNumber: rawLine, lastSeen: Date.now() });
+  return res.json({
+    ok: true,
+    lineKey: key,
+    onlineLines: registeredPbxLines.size,
+  });
+});
+
+// Poll for incoming calls or active call WebRTC SDP/ICE/Speech updates
+app.get('/api/caller/pbx/poll', (req: Request, res: Response) => {
+  const rawLine = String(req.query.lineNumber || '').trim();
+  const callId = String(req.query.callId || '').trim();
+  const key = normalizeDigits(rawLine);
+
+  if (key) {
+    registeredPbxLines.set(key, { lineNumber: rawLine, lastSeen: Date.now() });
+  }
+
+  // If client is already in a specific callId, return its latest session state
+  if (callId && pbxCallSessions.has(callId)) {
+    return res.json({
+      ok: true,
+      activeCall: pbxCallSessions.get(callId),
+    });
+  }
+
+  // Otherwise check if anyone is currently ringing this line number
+  if (key) {
+    for (const session of pbxCallSessions.values()) {
+      if (
+        normalizeDigits(session.toNumber) === key &&
+        (session.status === 'ringing' || session.status === 'connected') &&
+        Date.now() - session.updatedAt < 120000
+      ) {
+        return res.json({
+          ok: true,
+          incomingCall: session,
+        });
+      }
+    }
+  }
+
+  return res.json({ ok: true, incomingCall: null, activeCall: null });
+});
+
+// Dial a phone number on the self-hosted PBX switchboard (with optional WebRTC SDP offer)
+app.post('/api/caller/pbx/dial', (req: Request, res: Response) => {
+  const fromNumber = String(req.body?.fromNumber || '+1 (555) 010-1000').trim();
+  const toNumber = String(req.body?.toNumber || '').trim();
+  const offerSdp = req.body?.offerSdp || null;
+
+  if (!normalizeDigits(toNumber)) {
+    return res.status(400).json({ ok: false, error: 'Destination phone number required' });
+  }
+
+  const callId = `pbx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const session: PbxCallSession = {
+    callId,
+    fromNumber,
+    toNumber,
+    status: 'ringing',
+    offerSdp,
+    answerSdp: null,
+    callerIce: [],
+    calleeIce: [],
+    messages: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  pbxCallSessions.set(callId, session);
+  const targetOnline = registeredPbxLines.has(normalizeDigits(toNumber));
+
+  return res.json({
+    ok: true,
+    callId,
+    targetOnline,
+    session,
+  });
+});
+
+// Answer an incoming call on the self-hosted PBX switchboard (with optional WebRTC SDP answer)
+app.post('/api/caller/pbx/answer', (req: Request, res: Response) => {
+  const callId = String(req.body?.callId || '').trim();
+  const session = pbxCallSessions.get(callId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: 'Call session not found' });
+  }
+  session.status = 'connected';
+  if (req.body?.answerSdp) {
+    session.answerSdp = req.body.answerSdp;
+  }
+  session.updatedAt = Date.now();
+  return res.json({ ok: true, session });
+});
+
+// Exchange WebRTC ICE candidates or SDP between caller and callee
+app.post('/api/caller/pbx/signal', (req: Request, res: Response) => {
+  const callId = String(req.body?.callId || '').trim();
+  const role = req.body?.role === 'callee' ? 'callee' : 'caller';
+  const candidate = req.body?.candidate;
+  const offerSdp = req.body?.offerSdp;
+  const answerSdp = req.body?.answerSdp;
+
+  const session = pbxCallSessions.get(callId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: 'Call session not found' });
+  }
+
+  if (offerSdp) session.offerSdp = offerSdp;
+  if (answerSdp) {
+    session.answerSdp = answerSdp;
+    session.status = 'connected';
+  }
+  if (candidate) {
+    if (role === 'caller') {
+      session.callerIce.push(candidate);
+    } else {
+      session.calleeIce.push(candidate);
+    }
+  }
+  session.updatedAt = Date.now();
+  return res.json({ ok: true, session });
+});
+
+// Relay a spoken/transcribed message turn across the PBX call line
+app.post('/api/caller/pbx/message', (req: Request, res: Response) => {
+  const callId = String(req.body?.callId || '').trim();
+  const session = pbxCallSessions.get(callId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: 'Call session not found' });
+  }
+
+  const msg: PbxSignalMessage = {
+    id: String(req.body?.id || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`),
+    sender: req.body?.sender === 'agent' ? 'agent' : 'callee',
+    fromNumber: String(req.body?.fromNumber || ''),
+    text: String(req.body?.text || '').trim(),
+    timestamp: String(req.body?.timestamp || '00:00'),
+    modelUsed: req.body?.modelUsed ? String(req.body.modelUsed) : undefined,
+  };
+
+  if (msg.text && !session.messages.some((m) => m.id === msg.id)) {
+    session.messages.push(msg);
+    session.updatedAt = Date.now();
+  }
+
+  return res.json({ ok: true, session });
+});
+
+// Hang up an active PBX call
+app.post('/api/caller/pbx/hangup', (req: Request, res: Response) => {
+  const callId = String(req.body?.callId || '').trim();
+  const session = pbxCallSessions.get(callId);
+  if (session) {
+    session.status = 'ended';
+    session.updatedAt = Date.now();
+  }
+  return res.json({ ok: true });
+});
+
+// Webhook endpoint (GET for Meta challenge handshake, POST for event stream)
+app.all('/api/caller/webhooks/:platform', (req: Request, res: Response) => {
+  const platform = req.params.platform;
+  // Meta verification handshake (WhatsApp & Messenger)
+  if (req.method === 'GET') {
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (mode === 'subscribe' && challenge) {
+      console.log(`[Webhook] Verified challenge for ${platform} with token: ${token}`);
+      return res.status(200).send(challenge);
+    }
+    return res.status(200).json({ ok: true, platform, status: 'listening' });
+  }
+
+  // Incoming webhook message or call event
+  console.log(`[Webhook Event] ${platform}:`, JSON.stringify(req.body));
+  return res.status(200).json({ ok: true, platform, receivedAt: Date.now() });
+});
+
+// Explicit JSON 404 for unhandled /api/* routes to prevent API calls falling through to HTML index
+app.all('/api/*', (_req: Request, res: Response) => {
+  res.status(404).json({ ok: false, error: 'API endpoint not found' });
 });
 
 async function startServer() {

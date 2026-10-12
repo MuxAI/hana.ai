@@ -637,9 +637,9 @@ export const AI_PROFILE = {
     'https://muxai.vercel.app/Hana_banner4.png',
     'https://muxai.vercel.app/Hana_banner5.png',
   ],
-  vrmModelUrl: 'https://muxai.vercel.app/hana_v1.2_vrm1.vrm',
+  vrmModelUrl: 'https://muxai.vercel.app/hana_v1.3_vrm1.vrm',
   socials: {
-    instagram: 'https://instagram.com/hana_mux',
+    instagram: 'https://instagram.com/hana.intelligence',
     discord: 'https://discord.gg/GRRHsFqHrK',
     github: 'https://github.com/muxai/hana.ai',
   },
@@ -648,13 +648,20 @@ export const AI_PROFILE = {
 export const MODEL_SOURCE_DOMAIN = 'https://muxai.vercel.app';
 export const MODEL_FALLBACK_DOMAIN = 'https://ai.mux8.com';
 
+export const OMNICHANNEL_LOGOS = {
+  whatsapp: `${MODEL_SOURCE_DOMAIN}/logos/whatsapp.jpg`,
+  telegram: `${MODEL_SOURCE_DOMAIN}/logos/telegram.jpg`,
+  messenger: `${MODEL_SOURCE_DOMAIN}/logos/messenger.jpg`,
+  discord: 'https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/png/discord.png',
+} as const;
+
 export const WARDROBE_OUTFITS: WardrobeOutfit[] = [
   {
     id: 'mint-maid-apron',
     name: 'Mint Maid Apron',
-    fileName: 'hana_v1.2_vrm1.vrm',
-    modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.2_vrm1.vrm`,
-    fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.2_vrm1.vrm`,
+    fileName: 'hana_v1.3_vrm1.vrm',
+    modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_vrm1.vrm`,
+    fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_vrm1.vrm`,
     isPremium: false,
     isDefault: true,
   },
@@ -981,7 +988,7 @@ export function getWaitingAnimationCandidateUrls(fileName: string): string[] {
 }
 
 export const VRM_CONFIG = {
-  modelUrl: 'https://muxai.vercel.app/hana_v1.2_vrm1.vrm',
+  modelUrl: 'https://muxai.vercel.app/hana_v1.3_vrm1.vrm',
   animationUrl: 'https://muxai.vercel.app/mixamo_idle.fbx',
   fallAnimationUrl: 'https://muxai.vercel.app/mixamo_fall.fbx',
   getupAnimationUrl: 'https://muxai.vercel.app/mixamo_getup.fbx',
@@ -991,8 +998,8 @@ export const VRM_CONFIG = {
   cacheKey: 'hana_vrm_cache_v1',
   candidateModelUrls: [
     '/api/vrm',
-    'https://ai.mux8.com/hana_v1.2_vrm1.vrm',
-    'https://muxai.vercel.app/hana_v1.2_vrm1.vrm',
+    'https://ai.mux8.com/hana_v1.3_vrm1.vrm',
+    'https://muxai.vercel.app/hana_v1.3_vrm1.vrm',
   ],
   candidateAnimationUrls: [
     '/api/animation/idle',
@@ -1598,10 +1605,10 @@ export const API_PROVIDERS_CONFIG: Record<ApiProviderId, ApiProviderConfig> = {
     id: 'gemini',
     name: 'Gemini API',
     shortName: 'Gemini',
-    tagline: 'Google Gemini 2.5 Flash & 2.5 Pro',
+    tagline: 'Google Gemini 3.1 Flash-Lite & 3.8 Flash',
     logoUrl: 'https://muxai.vercel.app/logos/gemini.jpg',
-    defaultModel: 'gemini-2.5-flash',
-    availableModels: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-3.8-flash', 'gemini-2.0-flash'],
+    defaultModel: 'gemini-3.1-flash-lite',
+    availableModels: ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.1-pro-preview'],
     docsPath: '/docs/api/gemini',
   },
   anthropic: {

@@ -10,6 +10,9 @@ import {
   Palette,
   Github,
   Linkedin,
+  Facebook,
+  Instagram,
+  Twitter,
   ExternalLink,
   Heart,
   Award,
@@ -40,6 +43,7 @@ interface LandingPageProps {
   onNavigateToDocs?: (path?: string) => void;
   onNavigateToHumanizer?: () => void;
   onNavigateToInterview?: (path?: string) => void;
+  onNavigateToCaller?: () => void;
 }
 
 interface AccordionItem {
@@ -151,6 +155,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   onNavigateToDocs,
   onNavigateToHumanizer,
   onNavigateToInterview,
+  onNavigateToCaller,
 }) => {
   const [activeAccordion, setActiveAccordion] = useState<number>(0);
   const [activeAutomationAccordion, setActiveAutomationAccordion] = useState<number | null>(0);
@@ -991,19 +996,46 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                                   Experience Hana&apos;s AI Interview
                                 </span>
                                 <span className="text-[11px] text-neutral-500 block">
-                                  Interactive candidate POV with webcam/mic check, live voice &amp; recruiter review
+                                  Interactive candidate screening, recruiter studio, NeonDB persistence &amp; dossiers
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2 flex-wrap shrink-0">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    onNavigateToInterview
+                                      ? onNavigateToInterview('/interview?id=demo')
+                                      : onStartChat()
+                                  }
+                                  className="inline-flex items-center justify-center gap-2 px-4 py-2 rounded-xl text-xs font-bold bg-[#0f9bc7] hover:bg-[#117ba2] text-white shadow-xs hover:shadow transition-all active:scale-95 cursor-pointer"
+                                >
+                                  <span>Launch Demo</span>
+                                  <ArrowRight className="w-3.5 h-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          )}
+
+                          {item.id === 'voice-calling' && (
+                            <div className="mt-5 pt-4 border-t border-black/[0.06] flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                              <div>
+                                <span className="text-xs font-bold text-neutral-900 block">
+                                  Experience Hana&apos;s AI Voice Caller
+                                </span>
+                                <span className="text-[11px] text-neutral-500 block">
+                                  Direct phone dialing, editable RAG knowledge base &amp; real-time 2-way voice booking
                                 </span>
                               </div>
                               <button
                                 type="button"
                                 onClick={() =>
-                                  onNavigateToInterview
-                                    ? onNavigateToInterview('/interview?id=demo')
+                                  onNavigateToCaller
+                                    ? onNavigateToCaller()
                                     : onStartChat()
                                 }
                                 className="inline-flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-xs font-bold bg-[#0f9bc7] hover:bg-[#117ba2] text-white shadow-xs hover:shadow transition-all active:scale-95 cursor-pointer shrink-0"
                               >
-                                <span>Launch AI Interview</span>
+                                <span>Launch AI Caller</span>
                                 <ArrowRight className="w-3.5 h-3.5" />
                               </button>
                             </div>
@@ -1172,6 +1204,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                     'Connect custom local Ollama / vLLM servers',
                     'Connect with APIs and integrations',
                     'Sync account data, settings with cloud storage',
+                    'Create and review automated interviews',
+                    'Access the full Hana ecosystem',
                     'Enhanced customer support',
                     'Early access to new features',
                   ].map((feat, idx) => (
@@ -1179,7 +1213,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
                       <div className="w-5 h-5 rounded-full bg-[#55d2f6]/25 text-[#0a7a9e] flex items-center justify-center shrink-0 mt-0.5">
                         <Check className="w-3 h-3 stroke-[3]" />
                       </div>
-                      <span className={idx === 2 || idx === 3 || idx === 7 ? 'font-medium text-neutral-950' : ''}>
+                      <span className={idx === 2 || idx === 3 || idx === 7 || idx === 8 || idx === 9 ? 'font-medium text-neutral-950' : ''}>
                         {feat}
                       </span>
                     </div>
@@ -1304,21 +1338,54 @@ export const LandingPage: React.FC<LandingPageProps> = ({
 
       {/* FOOTER */}
       <footer className="relative z-20 border-t border-black/[0.08] bg-white py-12 px-4 sm:px-6 lg:px-8">
-        <div className="max-w-7xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-6">
+        <div className="max-w-7xl mx-auto flex flex-col items-center justify-center gap-5 text-center">
           {/* Company branding */}
-          <div className="flex items-center gap-3">
+          <div className="flex items-center justify-center gap-3">
             <a
-              href="https://mux8.com"
+              href="#"
               target="_blank"
               rel="noopener noreferrer"
               className="font-bold text-lg tracking-tight font-heading text-neutral-900 hover:text-[var(--theme-accent,#0f9bc7)] transition-colors"
             >
-              MuxAI
+              Hana
             </a>
           </div>
 
-          {/* Social Links */}
-          <div className="flex items-center gap-5 text-sm text-neutral-600">
+          {/* Social Links (Horizontally centered on mobile and desktop) */}
+          <div className="flex flex-wrap items-center justify-center gap-4 sm:gap-6 text-sm text-neutral-600">
+            <a
+              href="https://facebook.com/hana.intelligence"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 hover:text-neutral-900 font-medium transition-colors"
+              title="Hana on Facebook"
+            >
+              <Facebook className="w-4 h-4 text-[#1877f2]" />
+              <span>Facebook</span>
+            </a>
+
+            <a
+              href="https://instagram.com/hana.intelligence"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 hover:text-neutral-900 font-medium transition-colors"
+              title="Hana on Instagram"
+            >
+              <Instagram className="w-4 h-4 text-[#e4405f]" />
+              <span>Instagram</span>
+            </a>
+
+            <a
+              href="https://x.com/hanainteligence"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 hover:text-neutral-900 font-medium transition-colors"
+              title="Hana on X / Twitter"
+            >
+              <Twitter className="w-4 h-4 text-neutral-900" />
+              <span>X / Twitter</span>
+            </a>
+
             <a
               href="https://www.linkedin.com/company/huanmux"
               target="_blank"
@@ -1343,17 +1410,17 @@ export const LandingPage: React.FC<LandingPageProps> = ({
           </div>
 
           {/* Copyright notice */}
-          <div className="text-xs text-neutral-400 font-mono">
-            &copy; {new Date().getFullYear()}{' '}
+          <div className="text-xs text-neutral-400 font-mono text-center">
+            &copy; 2026{' '}
             <a
-              href="https://mux8.com"
+              href="https://ai.mux8.com"
               target="_blank"
               rel="noopener noreferrer"
               className="hover:text-neutral-700 hover:underline transition-colors"
             >
               MuxAI
             </a>
-            . All rights reserved.
+            . Hana Intelligence.
           </div>
         </div>
       </footer>

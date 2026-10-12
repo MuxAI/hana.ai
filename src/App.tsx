@@ -44,6 +44,11 @@ import {
   saveStoredIntegrations,
   addOrUpdateIntegration,
   removeStoredIntegration,
+  getSessionPassword,
+  setSessionPassword,
+  clearSessionPassword,
+  isCodeAlreadyRedeemed,
+  recordRedeemedCode,
 } from './lib/storage';
 import {
   streamPersonaResponse,
@@ -93,6 +98,8 @@ import { HumanizerPage } from './components/HumanizerPage';
 import { VoiceTesterPage } from './components/VoiceTesterPage';
 import { MMDStudioPage } from './components/MMDStudioPage';
 import { InterviewPage } from './components/InterviewPage';
+import { CallerPage } from './components/CallerPage';
+import { TorGamePage } from './components/TorGamePage';
 import { PremiumModal } from './components/PremiumModal';
 import { IntegrationLibraryItem } from './constants';
 import { dispatchChatToWebhooks } from './lib/integrations';
@@ -136,7 +143,13 @@ export default function App() {
         return '/voice';
       }
       if (path.startsWith('/interview')) {
-        return path;
+        return window.location.pathname + window.location.search;
+      }
+      if (path.startsWith('/caller')) {
+        return '/caller';
+      }
+      if (path.startsWith('/tor')) {
+        return '/tor';
       }
       return path.startsWith('/chat') ? '/chat' : '/';
     }
@@ -169,6 +182,10 @@ export default function App() {
         setCurrentRoute('/act');
         return;
       }
+      if (path.startsWith('/tor')) {
+        setCurrentRoute('/tor');
+        return;
+      }
       if (path.startsWith('/mmd')) {
         setCurrentRoute('/mmd');
         return;
@@ -178,7 +195,11 @@ export default function App() {
         return;
       }
       if (path.startsWith('/interview')) {
-        setCurrentRoute(path);
+        setCurrentRoute(window.location.pathname + window.location.search);
+        return;
+      }
+      if (path.startsWith('/caller')) {
+        setCurrentRoute('/caller');
         return;
       }
       setCurrentRoute(path.startsWith('/chat') ? '/chat' : '/');
@@ -186,6 +207,20 @@ export default function App() {
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  // Sync /interview route query params if URL search changes
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const interval = setInterval(() => {
+      if (window.location.pathname.startsWith('/interview')) {
+        const full = window.location.pathname + window.location.search;
+        if (currentRoute !== full) {
+          setCurrentRoute(full);
+        }
+      }
+    }, 200);
+    return () => clearInterval(interval);
+  }, [currentRoute]);
 
   const navigateTo = (path: string) => {
     if (typeof window !== 'undefined') {
@@ -203,12 +238,16 @@ export default function App() {
         normalized = path;
       } else if (path.startsWith('/act')) {
         normalized = '/act';
+      } else if (path.startsWith('/tor')) {
+        normalized = '/tor';
       } else if (path.startsWith('/mmd')) {
         normalized = '/mmd';
       } else if (path.startsWith('/voice')) {
         normalized = '/voice';
       } else if (path.startsWith('/interview')) {
         normalized = path;
+      } else if (path.startsWith('/caller')) {
+        normalized = '/caller';
       }
       window.history.pushState(null, '', normalized);
       setCurrentRoute(normalized);
@@ -539,6 +578,7 @@ export default function App() {
       }
       const user = data.user as AccountUser;
       setAccountUser(user);
+      setSessionPassword(password);
       // Sync existing local conversations, custom themes & unlocked outfits up to NeonDB for this new user
       fetch('/api/account/sync', {
         method: 'POST',
@@ -548,6 +588,7 @@ export default function App() {
           conversations,
           customThemes,
           unlockedOutfits: unlockedOutfitIds,
+          password,
         }),
       }).catch(() => {});
     },
@@ -571,6 +612,7 @@ export default function App() {
         throw new Error(data.error || 'Failed to sign in.');
       }
       const user = data.user as AccountUser;
+      setSessionPassword(password);
       const serverUnlocked = Array.isArray(user.unlocked_outfits)
         ? user.unlocked_outfits
         : Array.isArray(data.unlockedOutfits)
@@ -599,6 +641,7 @@ export default function App() {
             conversations,
             customThemes,
             unlockedOutfits: unlockedOutfitIds,
+            password,
           }),
         }).catch(() => {});
       }
@@ -611,6 +654,7 @@ export default function App() {
   );
 
   const handleSignOut = useCallback(() => {
+    clearSessionPassword();
     setAccountUser(null);
     setEquippedOutfitId(DEFAULT_OUTFIT_ID);
     setUnlockedOutfitIds([]);
@@ -645,19 +689,24 @@ export default function App() {
   const handleRedeemCode = useCallback(
     async (code: string) => {
       if (!accountUser) return;
+      const clean = code.trim().toUpperCase();
+      if (isCodeAlreadyRedeemed(clean)) {
+        throw new Error('You have already applied this redeem code.');
+      }
       const resp = await fetch('/api/account/redeem', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: accountUser.id,
-          code,
+          code: clean,
         }),
       });
       const data = await resp.json();
       if (!resp.ok || data.error) {
         throw new Error(data.error || 'Failed to redeem code.');
       }
-      const matchedSecret = resolveSecretOutfitsByRedeemCode(code).map((o) => o.id);
+      recordRedeemedCode(clean);
+      const matchedSecret = resolveSecretOutfitsByRedeemCode(clean).map((o) => o.id);
       if (data.user) {
         const userUnlocked = Array.isArray(data.user.unlocked_outfits)
           ? data.user.unlocked_outfits
@@ -680,6 +729,7 @@ export default function App() {
   // Sync conversations, custom themes & unlocked outfits to NeonDB when logged in
   useEffect(() => {
     if (!accountUser) return;
+    const sessionPwd = getSessionPassword();
     const syncTimer = setTimeout(() => {
       fetch('/api/account/sync', {
         method: 'POST',
@@ -689,6 +739,7 @@ export default function App() {
           conversations,
           customThemes,
           unlockedOutfits: unlockedOutfitIds,
+          password: sessionPwd || undefined,
         }),
       }).catch(() => {});
     }, 1200);
@@ -1191,9 +1242,29 @@ export default function App() {
   const lastDiscordStatusRef = useRef<{ status: string; msg: string }>({ status: '', msg: '' });
 
   useEffect(() => {
-    // 1. Discord Bot: trigger in the background automatically as soon as /chat app is launched if token detected
-    const isChatLaunched = currentRoute === '/chat' || currentRoute.startsWith('/chat') || currentRoute.startsWith('/app');
-    const storedDiscordToken = typeof window !== 'undefined' ? (localStorage.getItem('discord_bot_token') || '').trim() : '';
+    // 1. Discord Bot: trigger in the background automatically as soon as /chat or /caller is launched if token detected
+    const isChatLaunched =
+      currentRoute === '/chat' ||
+      currentRoute.startsWith('/chat') ||
+      currentRoute.startsWith('/app') ||
+      currentRoute === '/caller' ||
+      currentRoute.startsWith('/caller');
+
+    let storedDiscordToken = typeof window !== 'undefined' ? (localStorage.getItem('discord_bot_token') || '').trim() : '';
+    if (!storedDiscordToken && typeof window !== 'undefined') {
+      try {
+        const savedPlatforms =
+          localStorage.getItem('hana_caller_platforms_v2') ||
+          localStorage.getItem('hana_caller_platforms_v1') ||
+          localStorage.getItem('hana_caller_omnichannel_backup');
+        if (savedPlatforms) {
+          const parsed = JSON.parse(savedPlatforms);
+          if (parsed?.discord?.botToken) {
+            storedDiscordToken = parsed.discord.botToken.trim();
+          }
+        }
+      } catch {}
+    }
 
     let discordInt = activeIntegrations.find((i) => i.platform === 'discord');
     if (!discordInt && storedDiscordToken) {
@@ -2103,6 +2174,20 @@ export default function App() {
     );
   }
 
+  // Render Secret Combat Testbed & Torment Game at '/tor'
+  if (currentRoute.startsWith('/tor')) {
+    return (
+      <>
+        {shockwaveOverlay}
+        <TorGamePage
+          onBackToChat={() => navigateTo('/chat')}
+          onNavigateHome={() => navigateTo('/')}
+          onNavigateToAct={() => navigateTo('/act')}
+        />
+      </>
+    );
+  }
+
   // Render MMD Studio Stage at '/mmd'
   if (currentRoute.startsWith('/mmd')) {
     return (
@@ -2136,8 +2221,35 @@ export default function App() {
       <>
         {shockwaveOverlay}
         <InterviewPage
+          currentPath={currentRoute}
           onNavigateHome={() => navigateTo('/')}
           onNavigateToChat={() => navigateTo('/chat')}
+          onNavigateToInterview={(id) => navigateTo(id ? `/interview?id=${id}` : '/interview')}
+          isPremium={isPremium}
+          onRequirePremium={() => setIsPremiumModalOpen(true)}
+          accountUser={accountUser}
+        />
+      </>
+    );
+  }
+
+  // Render Autonomous AI Voice Caller & Agentic Booking at '/caller'
+  if (currentRoute.startsWith('/caller')) {
+    return (
+      <>
+        {shockwaveOverlay}
+        <CallerPage
+          onNavigateHome={() => navigateTo('/')}
+          onNavigateToChat={() => navigateTo('/chat')}
+          onNavigateToDocs={(p) => navigateTo(p || '/docs')}
+          activeModel={activeModel}
+          onSelectModel={handleSelectModel}
+          cacheStatuses={cacheStatuses}
+          ollamaStatus={ollamaStatus}
+          onUpdateCustomUrl={handleUpdateCustomUrl}
+          userSettings={userSettings}
+          onUpdateSettings={handleUpdateSettings}
+          activeOutfitFileName={activeOutfit.fileName}
         />
       </>
     );
@@ -2167,7 +2279,8 @@ export default function App() {
           onStartChat={() => navigateTo('/chat')}
           onNavigateToDocs={(p) => navigateTo(p || '/docs')}
           onNavigateToHumanizer={() => navigateTo('/humanizer')}
-          onNavigateToInterview={(p) => navigateTo(p || '/interview?id=demo')}
+          onNavigateToInterview={(p) => navigateTo(p || '/interview')}
+          onNavigateToCaller={() => navigateTo('/caller')}
         />
       </>
     );
@@ -2447,6 +2560,7 @@ export default function App() {
             onRemoveIntegration={handleRemoveIntegration}
             onNavigateToDocs={navigateTo}
             onMicAlert={setMicAlert}
+            isHanaSpeaking={Boolean(currentlySpeakingMsgId !== null || isPainSoundActive)}
           />
         </div>
       </main>

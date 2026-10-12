@@ -3,6 +3,7 @@ import dotenv from 'dotenv';
 import pg from 'pg';
 import crypto from 'crypto';
 import { GoogleGenAI } from '@google/genai';
+import { buildSchema, graphql } from 'graphql';
 
 dotenv.config();
 
@@ -284,6 +285,44 @@ VALUES
   ], 3650, 100000)
 ON CONFLICT (code) DO UPDATE SET
   unlocked_outfit_ids = EXCLUDED.unlocked_outfit_ids;
+
+CREATE TABLE IF NOT EXISTS interviews (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  target_role TEXT NOT NULL,
+  company_name TEXT NOT NULL DEFAULT 'MuxAI',
+  description TEXT,
+  created_by_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
+  created_by_email TEXT,
+  config JSONB NOT NULL DEFAULT '{}',
+  questions JSONB NOT NULL DEFAULT '[]',
+  tasks JSONB NOT NULL DEFAULT '{}',
+  company_qa_knowledge JSONB NOT NULL DEFAULT '[]',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_interviews_created_by ON interviews(created_by_user_id);
+CREATE INDEX IF NOT EXISTS idx_interviews_active ON interviews(active);
+
+CREATE TABLE IF NOT EXISTS interview_submissions (
+  id TEXT PRIMARY KEY,
+  interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+  candidate_name TEXT NOT NULL,
+  candidate_email TEXT,
+  status TEXT NOT NULL DEFAULT 'completed',
+  score INTEGER DEFAULT 85,
+  responses JSONB NOT NULL DEFAULT '[]',
+  snapshots JSONB NOT NULL DEFAULT '[]',
+  resume_data JSONB,
+  written_task TEXT,
+  pressure_rating TEXT,
+  ai_evaluation JSONB,
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_subs_interview_id ON interview_submissions(interview_id);
 `;
 
 async function ensureNeonSchema() {
@@ -783,6 +822,304 @@ async function syncUserConversationsAndThemes(params) {
 }
 
 // =====================================================================
+// AUTONOMOUS AI INTERVIEWS & RECRUITING SUITE (NeonDB Persistence)
+// =====================================================================
+const DEFAULT_DEMO_INTERVIEW = {
+  id: 'demo',
+  title: 'Senior Full Stack & AI Systems Engineer',
+  target_role: 'Senior Full Stack & AI Systems Engineer',
+  company_name: 'MuxAI',
+  description: 'Autonomous technical screening with Hana covering core engineering background, complex architecture, written reflection, situational performance, and interactive Q&A.',
+  created_by_user_id: null,
+  created_by_email: 'recruiting@muxai.com',
+  config: {
+    openQuestionSilenceSeconds: 3.0,
+    qaSilenceSeconds: 5.0,
+    activeSilenceVoiceline: "I am assuming you have nothing else to say for now so let's move on to the next step.",
+    showHana3DModel: true,
+    recruiterPersonaName: 'Hana',
+  },
+  questions: [
+    {
+      id: 'q1',
+      phase: 'question_1',
+      prompt: "Let's begin with a quick introduction. Could you tell me a bit about yourself, your background, and what drives your passion for this role?",
+      description: 'Introduction & Background',
+    },
+    {
+      id: 'q2',
+      phase: 'question_2',
+      prompt: "Thank you. Now, could you walk me through a challenging technical problem or project you tackled recently? How did you approach resolving it?",
+      description: 'Technical Problem Solving',
+    },
+  ],
+  tasks: {
+    requireResumeUpload: true,
+    requireWrittenReflection: true,
+    writtenPrompt: 'Please share three things you like about yourself and why. (Min 100 characters)',
+    minWrittenChars: 100,
+    requirePressureRating: true,
+    requireSnapshotCheck: true,
+  },
+  company_qa_knowledge: [],
+  active: true,
+  created_at: '2026-01-01T00:00:00.000Z',
+  updated_at: '2026-01-01T00:00:00.000Z',
+};
+
+const fallbackInterviews = new Map([
+  ['demo', DEFAULT_DEMO_INTERVIEW],
+]);
+const fallbackInterviewSubmissions = new Map();
+
+async function createInterviewInDb(interview) {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const res = await pool.query(
+        `INSERT INTO interviews (
+          id, title, target_role, company_name, description,
+          created_by_user_id, created_by_email, config, questions, tasks,
+          company_qa_knowledge, active, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+        ON CONFLICT (id) DO UPDATE SET
+          title = EXCLUDED.title,
+          target_role = EXCLUDED.target_role,
+          company_name = EXCLUDED.company_name,
+          description = EXCLUDED.description,
+          config = EXCLUDED.config,
+          questions = EXCLUDED.questions,
+          tasks = EXCLUDED.tasks,
+          company_qa_knowledge = EXCLUDED.company_qa_knowledge,
+          active = EXCLUDED.active,
+          updated_at = NOW()
+        RETURNING *`,
+        [
+          interview.id,
+          interview.title,
+          interview.target_role,
+          interview.company_name || 'MuxAI',
+          interview.description || '',
+          interview.created_by_user_id || null,
+          interview.created_by_email || null,
+          JSON.stringify(interview.config || {}),
+          JSON.stringify(interview.questions || []),
+          JSON.stringify(interview.tasks || {}),
+          JSON.stringify(interview.company_qa_knowledge || []),
+          interview.active !== false,
+        ]
+      );
+      if (res.rows[0]) {
+        const row = res.rows[0];
+        const record = {
+          id: row.id,
+          title: row.title,
+          target_role: row.target_role,
+          company_name: row.company_name,
+          description: row.description,
+          created_by_user_id: row.created_by_user_id,
+          created_by_email: row.created_by_email,
+          config: typeof row.config === 'string' ? JSON.parse(row.config) : row.config || {},
+          questions: typeof row.questions === 'string' ? JSON.parse(row.questions) : row.questions || [],
+          tasks: typeof row.tasks === 'string' ? JSON.parse(row.tasks) : row.tasks || {},
+          company_qa_knowledge: typeof row.company_qa_knowledge === 'string' ? JSON.parse(row.company_qa_knowledge) : row.company_qa_knowledge || [],
+          active: row.active,
+          created_at: new Date(row.created_at).toISOString(),
+          updated_at: new Date(row.updated_at).toISOString(),
+        };
+        fallbackInterviews.set(record.id, record);
+        return record;
+      }
+    } catch (err) {
+      console.warn('NeonDB createInterview error in api/index.js:', err);
+    }
+  }
+
+  const record = {
+    ...interview,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  fallbackInterviews.set(record.id, record);
+  return record;
+}
+
+async function getInterviewByIdFromDb(id) {
+  const cleanId = String(id || '').trim();
+  if (!cleanId) return null;
+
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const res = await pool.query('SELECT * FROM interviews WHERE id = $1 LIMIT 1', [cleanId]);
+      if (res.rows[0]) {
+        const row = res.rows[0];
+        const record = {
+          id: row.id,
+          title: row.title,
+          target_role: row.target_role,
+          company_name: row.company_name,
+          description: row.description,
+          created_by_user_id: row.created_by_user_id,
+          created_by_email: row.created_by_email,
+          config: typeof row.config === 'string' ? JSON.parse(row.config) : row.config || {},
+          questions: typeof row.questions === 'string' ? JSON.parse(row.questions) : row.questions || [],
+          tasks: typeof row.tasks === 'string' ? JSON.parse(row.tasks) : row.tasks || {},
+          company_qa_knowledge: typeof row.company_qa_knowledge === 'string' ? JSON.parse(row.company_qa_knowledge) : row.company_qa_knowledge || [],
+          active: row.active,
+          created_at: new Date(row.created_at).toISOString(),
+          updated_at: new Date(row.updated_at).toISOString(),
+        };
+        fallbackInterviews.set(record.id, record);
+        return record;
+      }
+    } catch (err) {
+      console.warn('NeonDB getInterview error in api/index.js:', err);
+    }
+  }
+
+  return fallbackInterviews.get(cleanId) || (cleanId === 'demo' ? DEFAULT_DEMO_INTERVIEW : null);
+}
+
+async function listInterviewsFromDb(userId) {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const query = userId
+        ? 'SELECT * FROM interviews WHERE (created_by_user_id = $1 OR id = \'demo\') AND active = TRUE ORDER BY created_at DESC'
+        : 'SELECT * FROM interviews WHERE active = TRUE ORDER BY created_at DESC';
+      const params = userId ? [userId] : [];
+      const res = await pool.query(query, params);
+      if (res.rows.length > 0) {
+        return res.rows.map((row) => ({
+          id: row.id,
+          title: row.title,
+          target_role: row.target_role,
+          company_name: row.company_name,
+          description: row.description,
+          created_by_user_id: row.created_by_user_id,
+          created_by_email: row.created_by_email,
+          config: typeof row.config === 'string' ? JSON.parse(row.config) : row.config || {},
+          questions: typeof row.questions === 'string' ? JSON.parse(row.questions) : row.questions || [],
+          tasks: typeof row.tasks === 'string' ? JSON.parse(row.tasks) : row.tasks || {},
+          company_qa_knowledge: typeof row.company_qa_knowledge === 'string' ? JSON.parse(row.company_qa_knowledge) : row.company_qa_knowledge || [],
+          active: row.active,
+          created_at: new Date(row.created_at).toISOString(),
+          updated_at: new Date(row.updated_at).toISOString(),
+        }));
+      }
+    } catch (err) {
+      console.warn('NeonDB listInterviews error in api/index.js:', err);
+    }
+  }
+
+  const items = Array.from(fallbackInterviews.values()).filter((i) => i.active);
+  if (!items.some((i) => i.id === 'demo')) {
+    items.unshift(DEFAULT_DEMO_INTERVIEW);
+  }
+  return items;
+}
+
+async function deleteInterviewFromDb(id, userId) {
+  const cleanId = String(id || '').trim();
+  if (!cleanId || cleanId === 'demo') return false;
+
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      if (userId) {
+        await pool.query('DELETE FROM interviews WHERE id = $1 AND created_by_user_id = $2', [cleanId, userId]);
+      } else {
+        await pool.query('DELETE FROM interviews WHERE id = $1', [cleanId]);
+      }
+    } catch (err) {
+      console.warn('NeonDB deleteInterview error in api/index.js:', err);
+    }
+  }
+
+  fallbackInterviews.delete(cleanId);
+  return true;
+}
+
+async function submitInterviewSessionToDb(submission) {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      await pool.query(
+        `INSERT INTO interview_submissions (
+          id, interview_id, candidate_name, candidate_email, status, score,
+          responses, snapshots, resume_data, written_task, pressure_rating,
+          ai_evaluation, completed_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+        ON CONFLICT (id) DO NOTHING`,
+        [
+          submission.id,
+          submission.interview_id,
+          submission.candidate_name,
+          submission.candidate_email || null,
+          submission.status || 'completed',
+          submission.score ?? 85,
+          JSON.stringify(submission.responses || []),
+          JSON.stringify(submission.snapshots || []),
+          submission.resume_data ? JSON.stringify(submission.resume_data) : null,
+          submission.written_task || '',
+          submission.pressure_rating || '',
+          submission.ai_evaluation ? JSON.stringify(submission.ai_evaluation) : null,
+        ]
+      );
+    } catch (err) {
+      console.warn('NeonDB submitInterviewSession error in api/index.js:', err);
+    }
+  }
+
+  const list = fallbackInterviewSubmissions.get(submission.interview_id) || [];
+  list.unshift(submission);
+  fallbackInterviewSubmissions.set(submission.interview_id, list);
+  return submission;
+}
+
+async function listInterviewSubmissionsFromDb(interviewId) {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const query = interviewId
+        ? 'SELECT * FROM interview_submissions WHERE interview_id = $1 ORDER BY completed_at DESC LIMIT 50'
+        : 'SELECT * FROM interview_submissions ORDER BY completed_at DESC LIMIT 50';
+      const params = interviewId ? [interviewId] : [];
+      const res = await pool.query(query, params);
+      if (res.rows.length > 0) {
+        return res.rows.map((row) => ({
+          id: row.id,
+          interview_id: row.interview_id,
+          candidate_name: row.candidate_name,
+          candidate_email: row.candidate_email,
+          status: row.status,
+          score: Number(row.score) || 85,
+          responses: typeof row.responses === 'string' ? JSON.parse(row.responses) : row.responses || [],
+          snapshots: typeof row.snapshots === 'string' ? JSON.parse(row.snapshots) : row.snapshots || [],
+          resume_data: typeof row.resume_data === 'string' ? JSON.parse(row.resume_data) : row.resume_data,
+          written_task: row.written_task,
+          pressure_rating: row.pressure_rating,
+          ai_evaluation: typeof row.ai_evaluation === 'string' ? JSON.parse(row.ai_evaluation) : row.ai_evaluation,
+          completed_at: new Date(row.completed_at).toISOString(),
+        }));
+      }
+    } catch (err) {
+      console.warn('NeonDB listInterviewSubmissions error in api/index.js:', err);
+    }
+  }
+
+  if (interviewId) {
+    return fallbackInterviewSubmissions.get(interviewId) || [];
+  }
+  const all = [];
+  for (const list of fallbackInterviewSubmissions.values()) {
+    all.push(...list);
+  }
+  return all.sort((a, b) => Date.parse(b.completed_at) - Date.parse(a.completed_at));
+}
+
+// =====================================================================
 // Express App & Router Setup
 // =====================================================================
 const apiApp = express();
@@ -847,12 +1184,12 @@ router.get('/health', (_req, res) => {
 router.get('/vrm', async (req, res) => {
   try {
     const requestedFile = typeof req.query.file === 'string' ? req.query.file.trim() : '';
-    const safeFile = /^[a-zA-Z0-9_.-]+\.vrm$/.test(requestedFile) ? requestedFile : 'hana_v1.2_vrm1.vrm';
+    const safeFile = /^[a-zA-Z0-9_.-]+\.vrm$/.test(requestedFile) ? requestedFile : 'hana_v1.3_vrm1.vrm';
 
     const targetUrls = [
       `${MODEL_SOURCE_DOMAIN}/${safeFile}`,
       `${MODEL_FALLBACK_DOMAIN}/${safeFile}`,
-      `${MODEL_SOURCE_DOMAIN}/hana_v1.2_vrm1.vrm`,
+      `${MODEL_SOURCE_DOMAIN}/hana_v1.3_vrm1.vrm`,
     ];
 
     let vrmResp = null;
@@ -1188,15 +1525,36 @@ router.post('/chat', async (req, res) => {
 
     const outputTokens = Math.min(Math.max(Number(maxTokens) || 512, 64), 4096);
 
-    const responseStream = await ai.models.generateContentStream({
-      model: 'gemini-3.8-flash',
-      contents: formattedContents,
-      config: {
-        systemInstruction: systemPrompt || DEFAULT_SYSTEM_PROMPT,
-        temperature: 0.85,
-        maxOutputTokens: outputTokens,
-      },
-    });
+    const candidateModels = [
+      'gemini-3.1-flash-lite',
+      'gemini-flash-latest',
+      'gemini-3.8-flash',
+    ];
+
+    let responseStream = null;
+    let lastError = null;
+
+    for (const cand of candidateModels) {
+      try {
+        responseStream = await ai.models.generateContentStream({
+          model: cand,
+          contents: formattedContents,
+          config: {
+            systemInstruction: systemPrompt || DEFAULT_SYSTEM_PROMPT,
+            temperature: 0.85,
+            maxOutputTokens: outputTokens,
+          },
+        });
+        if (responseStream) break;
+      } catch (streamErr) {
+        lastError = streamErr;
+        console.warn(`Model ${cand} unavailable in api/chat:`, streamErr.message || streamErr);
+      }
+    }
+
+    if (!responseStream) {
+      throw lastError || new Error('No available Gemini model responded');
+    }
 
     for await (const chunk of responseStream) {
       const text = chunk.text;
@@ -1629,6 +1987,1415 @@ router.post('/account/sync', async (req, res) => {
     const message = err instanceof Error ? err.message : 'Failed to sync account data.';
     res.status(400).json({ error: message });
   }
+});
+
+// =====================================================================
+// Autonomous AI Interviews & NeonDB Recruiting Suite Endpoints
+// =====================================================================
+
+// Create a new interview
+router.post('/interview/create', async (req, res) => {
+  try {
+    const body = req.body || {};
+    if (!body.title || !body.target_role) {
+      return res.status(400).json({ ok: false, error: 'Interview title and target role are required.' });
+    }
+    const id = body.id || `iv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const record = {
+      id,
+      title: String(body.title).trim(),
+      target_role: String(body.target_role).trim(),
+      company_name: String(body.company_name || 'MuxAI').trim(),
+      description: String(body.description || '').trim(),
+      created_by_user_id: body.created_by_user_id ? Number(body.created_by_user_id) : null,
+      created_by_email: body.created_by_email ? String(body.created_by_email).trim() : null,
+      config: body.config || {},
+      questions: Array.isArray(body.questions) ? body.questions : [],
+      tasks: body.tasks || {},
+      company_qa_knowledge: Array.isArray(body.company_qa_knowledge) ? body.company_qa_knowledge : [],
+      active: body.active !== false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    };
+
+    const saved = await createInterviewInDb(record);
+    return res.json({ ok: true, interview: saved });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to create interview';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// List all active interviews
+router.get('/interview/list', async (req, res) => {
+  try {
+    const userId = req.query.userId ? Number(req.query.userId) : undefined;
+    const interviews = await listInterviewsFromDb(userId);
+    return res.json({ ok: true, interviews });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to list interviews';
+    return res.status(500).json({ ok: false, error: message, interviews: [DEFAULT_DEMO_INTERVIEW] });
+  }
+});
+
+// List interview submissions / history
+router.get(['/interview-history', '/interview/history', '/interview/submissions'], async (req, res) => {
+  try {
+    const interviewId = req.query.interviewId ? String(req.query.interviewId).trim() : undefined;
+    const submissions = await listInterviewSubmissionsFromDb(interviewId);
+    return res.json({ ok: true, submissions });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to fetch interview history';
+    return res.status(500).json({ ok: false, error: message, submissions: [] });
+  }
+});
+
+// Submit a completed candidate session for an interview
+router.post(['/interview/:id/submit', '/interview/submit'], async (req, res) => {
+  try {
+    const rawId = req.params.id || req.body?.interview_id || 'demo';
+    const interviewId = String(rawId).trim();
+    const body = req.body || {};
+    const subId = body.id || `sub_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const submission = {
+      id: subId,
+      interview_id: interviewId,
+      candidate_name: String(body.candidate_name || 'Candidate').trim(),
+      candidate_email: body.candidate_email ? String(body.candidate_email).trim() : undefined,
+      status: body.status || 'completed',
+      score: typeof body.score === 'number' ? body.score : 85,
+      responses: Array.isArray(body.responses) ? body.responses : [],
+      snapshots: Array.isArray(body.snapshots) ? body.snapshots : [],
+      resume_data: body.resume_data || null,
+      written_task: body.written_task || '',
+      pressure_rating: body.pressure_rating || '',
+      ai_evaluation: body.ai_evaluation || undefined,
+      completed_at: new Date().toISOString(),
+    };
+
+    const saved = await submitInterviewSessionToDb(submission);
+    return res.json({ ok: true, submission: saved });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to submit interview session';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// Get a single interview by ID
+router.get('/interview/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id) {
+      return res.status(400).json({ ok: false, error: 'Interview ID is required' });
+    }
+    const interview = await getInterviewByIdFromDb(id);
+    if (!interview) {
+      if (id === 'demo') {
+        return res.json({ ok: true, interview: DEFAULT_DEMO_INTERVIEW });
+      }
+      return res.status(404).json({ ok: false, error: `Interview "${id}" not found` });
+    }
+    return res.json({ ok: true, interview });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to fetch interview';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// Delete an interview by ID
+router.delete('/interview/:id', async (req, res) => {
+  try {
+    const id = String(req.params.id || '').trim();
+    if (!id || id === 'demo') {
+      return res.status(400).json({ ok: false, error: 'Cannot delete demo interview template.' });
+    }
+    const userId = req.body?.userId ? Number(req.body.userId) : undefined;
+    const success = await deleteInterviewFromDb(id, userId);
+    return res.json({ ok: success });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to delete interview';
+    return res.status(500).json({ ok: false, error: message });
+  }
+});
+
+// =====================================================================
+// Self-Hosted Zero-API WebRTC & Real-Time Telephone PBX Switchboard
+// =====================================================================
+const registeredPbxLines = new Map();
+const pbxCallSessions = new Map();
+
+function normalizeDigits(raw) {
+  const digits = String(raw || '').replace(/[^0-9]/g, '');
+  if (digits.length === 10) return `1${digits}`;
+  return digits;
+}
+
+router.post('/caller/pbx/register', (req, res) => {
+  const rawLine = String(req.body?.lineNumber || '').trim();
+  const key = normalizeDigits(rawLine);
+  if (!key) {
+    return res.status(400).json({ ok: false, error: 'Invalid line number' });
+  }
+  registeredPbxLines.set(key, { lineNumber: rawLine, lastSeen: Date.now() });
+  return res.json({
+    ok: true,
+    lineKey: key,
+    onlineLines: registeredPbxLines.size,
+  });
+});
+
+router.get('/caller/pbx/poll', (req, res) => {
+  const rawLine = String(req.query.lineNumber || '').trim();
+  const callId = String(req.query.callId || '').trim();
+  const key = normalizeDigits(rawLine);
+
+  if (key) {
+    registeredPbxLines.set(key, { lineNumber: rawLine, lastSeen: Date.now() });
+  }
+
+  if (callId && pbxCallSessions.has(callId)) {
+    return res.json({
+      ok: true,
+      activeCall: pbxCallSessions.get(callId),
+    });
+  }
+
+  if (key) {
+    for (const session of pbxCallSessions.values()) {
+      if (
+        normalizeDigits(session.toNumber) === key &&
+        (session.status === 'ringing' || session.status === 'connected') &&
+        Date.now() - session.updatedAt < 120000
+      ) {
+        return res.json({
+          ok: true,
+          incomingCall: session,
+        });
+      }
+    }
+  }
+
+  return res.json({ ok: true, incomingCall: null, activeCall: null });
+});
+
+router.post('/caller/pbx/dial', (req, res) => {
+  const fromNumber = String(req.body?.fromNumber || '+1 (555) 010-1000').trim();
+  const toNumber = String(req.body?.toNumber || '').trim();
+  const offerSdp = req.body?.offerSdp || null;
+
+  if (!normalizeDigits(toNumber)) {
+    return res.status(400).json({ ok: false, error: 'Destination phone number required' });
+  }
+
+  const callId = `pbx_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+  const session = {
+    callId,
+    fromNumber,
+    toNumber,
+    status: 'ringing',
+    offerSdp,
+    answerSdp: null,
+    callerIce: [],
+    calleeIce: [],
+    messages: [],
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  pbxCallSessions.set(callId, session);
+  const targetOnline = registeredPbxLines.has(normalizeDigits(toNumber));
+
+  return res.json({
+    ok: true,
+    callId,
+    targetOnline,
+    session,
+  });
+});
+
+router.post('/caller/pbx/answer', (req, res) => {
+  const callId = String(req.body?.callId || '').trim();
+  const session = pbxCallSessions.get(callId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: 'Call session not found' });
+  }
+  session.status = 'connected';
+  if (req.body?.answerSdp) {
+    session.answerSdp = req.body.answerSdp;
+  }
+  session.updatedAt = Date.now();
+  return res.json({ ok: true, session });
+});
+
+router.post('/caller/pbx/signal', (req, res) => {
+  const callId = String(req.body?.callId || '').trim();
+  const role = req.body?.role === 'callee' ? 'callee' : 'caller';
+  const candidate = req.body?.candidate;
+  const offerSdp = req.body?.offerSdp;
+  const answerSdp = req.body?.answerSdp;
+
+  const session = pbxCallSessions.get(callId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: 'Call session not found' });
+  }
+
+  if (offerSdp) session.offerSdp = offerSdp;
+  if (answerSdp) {
+    session.answerSdp = answerSdp;
+    session.status = 'connected';
+  }
+  if (candidate) {
+    if (role === 'caller') {
+      session.callerIce.push(candidate);
+    } else {
+      session.calleeIce.push(candidate);
+    }
+  }
+  session.updatedAt = Date.now();
+  return res.json({ ok: true, session });
+});
+
+router.post('/caller/pbx/message', (req, res) => {
+  const callId = String(req.body?.callId || '').trim();
+  const session = pbxCallSessions.get(callId);
+  if (!session) {
+    return res.status(404).json({ ok: false, error: 'Call session not found' });
+  }
+
+  const msg = {
+    id: String(req.body?.id || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`),
+    sender: req.body?.sender === 'agent' ? 'agent' : 'callee',
+    fromNumber: String(req.body?.fromNumber || ''),
+    text: String(req.body?.text || '').trim(),
+    timestamp: String(req.body?.timestamp || '00:00'),
+    modelUsed: req.body?.modelUsed ? String(req.body.modelUsed) : undefined,
+  };
+
+  if (msg.text && !session.messages.some((m) => m.id === msg.id)) {
+    session.messages.push(msg);
+    session.updatedAt = Date.now();
+  }
+
+  return res.json({ ok: true, session });
+});
+
+router.post('/caller/pbx/hangup', (req, res) => {
+  const callId = String(req.body?.callId || '').trim();
+  const session = pbxCallSessions.get(callId);
+  if (session) {
+    session.status = 'ended';
+    session.updatedAt = Date.now();
+  }
+  return res.json({ ok: true });
+});
+
+// =====================================================================
+// 3RD-PARTY PLATFORM CALLING & VOICE INTEGRATIONS (WhatsApp, Telegram, Messenger, Discord)
+// =====================================================================
+const omnichannelCallMessages = new Map();
+const telegramLastUpdateOffsets = new Map();
+
+async function synthesizeHanaVoice(text) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) return null;
+  try {
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+    });
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: (text || '').slice(0, 1200),
+              speechMetadata: {
+                style: 'Warm, cheerful anime companion voice',
+              },
+            },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
+          },
+        },
+      },
+    });
+    const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    if (base64Audio) {
+      return Buffer.from(base64Audio, 'base64');
+    }
+  } catch (err) {
+    console.warn('TTS voice generation failed in api/index.js:', err);
+  }
+  return null;
+}
+
+router.post('/caller/platforms/test', async (req, res) => {
+  try {
+    const { platform, config, credentials } = req.body || {};
+    const creds = credentials || config || {};
+    if (!platform) {
+      return res.status(400).json({ ok: false, error: 'Platform identifier is required' });
+    }
+
+    if (platform === 'whatsapp') {
+      const token = (creds?.accessToken || '').trim();
+      const phoneId = (creds?.phoneNumberId || '').trim();
+      if (!token) return res.status(400).json({ ok: false, error: 'Meta Access Token required for WhatsApp' });
+      const url = phoneId ? `https://graph.facebook.com/v21.0/${phoneId}` : 'https://graph.facebook.com/v21.0/me';
+      const metaResp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+      const data = await metaResp.json().catch(() => ({}));
+      if (!metaResp.ok) return res.status(metaResp.status).json({ ok: false, error: data?.error?.message || 'WhatsApp credentials invalid' });
+      return res.json({ ok: true, platform: 'whatsapp', verified: true, details: { displayPhoneNumber: data.display_phone_number || phoneId || 'Verified', verifiedName: data.verified_name || 'Hana WhatsApp Agent' } });
+    }
+
+    if (platform === 'telegram') {
+      const botToken = (creds?.botToken || '').trim().replace(/^bot/i, '');
+      if (!botToken) return res.status(400).json({ ok: false, error: 'Telegram Bot Token required' });
+      const tgResp = await fetch(`https://api.telegram.org/bot${botToken}/getMe`);
+      const data = await tgResp.json().catch(() => ({}));
+      if (!data?.ok) return res.status(400).json({ ok: false, error: data?.description || 'Telegram bot token invalid' });
+      return res.json({ ok: true, platform: 'telegram', verified: true, details: { username: data.result?.username, firstName: data.result?.first_name } });
+    }
+
+    if (platform === 'messenger') {
+      const pageToken = (creds?.pageAccessToken || '').trim();
+      const pageId = (creds?.pageId || '').trim();
+      if (!pageToken) return res.status(400).json({ ok: false, error: 'Page Access Token required for Messenger' });
+      const url = pageId ? `https://graph.facebook.com/v21.0/${pageId}?access_token=${pageToken}` : `https://graph.facebook.com/v21.0/me?access_token=${pageToken}`;
+      const fbResp = await fetch(url);
+      const data = await fbResp.json().catch(() => ({}));
+      if (!fbResp.ok) return res.status(fbResp.status).json({ ok: false, error: data?.error?.message || 'Facebook Page credentials invalid' });
+      return res.json({ ok: true, platform: 'messenger', verified: true, details: { pageName: data.name || pageId || 'Verified Page', id: data.id || pageId } });
+    }
+
+    if (platform === 'discord') {
+      const botToken = (creds?.botToken || '').trim().replace(/^Bot\s+/i, '');
+      if (!botToken) return res.status(400).json({ ok: false, error: 'Discord Bot Token is required' });
+      const discordResp = await fetch('https://discord.com/api/v10/users/@me', {
+        headers: {
+          Authorization: `Bot ${botToken}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const data = await discordResp.json().catch(() => ({}));
+      if (!discordResp.ok) {
+        return res.status(discordResp.status).json({
+          ok: false,
+          error: data?.message || 'Discord Bot Token is invalid or bot not found',
+        });
+      }
+      return res.json({
+        ok: true,
+        platform: 'discord',
+        verified: true,
+        details: {
+          username: `@${data.username}`,
+          id: data.id,
+          discriminator: data.discriminator || '0',
+          supportsVoiceCalls: true,
+        },
+      });
+    }
+
+    return res.status(400).json({ ok: false, error: `Unknown platform "${platform}"` });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || 'Platform test failed' });
+  }
+});
+
+router.post('/caller/platforms/dispatch', async (req, res) => {
+  try {
+    const { platform, config, credentials, message, to, recipient, callerUrl } = req.body || {};
+    const creds = credentials || config || {};
+    const targetRecipient = String(to || recipient || '').trim();
+
+    if (!platform || !message) {
+      return res.status(400).json({ ok: false, error: 'Platform and message are required' });
+    }
+    const dispatchTime = new Date().toLocaleTimeString();
+    const dispatchId = `disp_${platform}_${Date.now()}`;
+
+    const host = req.get('host') || 'localhost:3000';
+    const protocol = req.protocol === 'https' || req.get('x-forwarded-proto') === 'https' ? 'https' : 'http';
+    const baseUrl = callerUrl || `${protocol}://${host}`;
+    const liveCallRoomUrl = `${baseUrl}/caller`;
+
+    if (platform === 'whatsapp') {
+      const token = (creds?.accessToken || '').trim();
+      const phoneId = (creds?.phoneNumberId || '').trim();
+      const targetPhone = (targetRecipient || creds?.targetNumber || '').replace(/[^0-9]/g, '');
+      if (!token || !phoneId || !targetPhone) return res.status(400).json({ ok: false, error: 'WhatsApp credentials and target phone required' });
+      const waResp = await fetch(`https://graph.facebook.com/v21.0/${phoneId}/messages`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messaging_product: 'whatsapp', recipient_type: 'individual', to: targetPhone, type: 'text', text: { body: `📞 [Hana AI Live Voice Call Session]\n\n"${message}"\n\n🎙️ Answer Live: ${liveCallRoomUrl}` } }),
+      });
+      const waData = await waResp.json().catch(() => ({}));
+      if (!waResp.ok) return res.status(waResp.status).json({ ok: false, error: waData?.error?.message || 'WhatsApp dispatch failed' });
+      return res.json({ ok: true, dispatchId, platform: 'whatsapp', to: targetPhone, message, timestamp: dispatchTime });
+    }
+
+    if (platform === 'telegram') {
+      const botToken = (creds?.botToken || '').trim().replace(/^bot/i, '');
+      const chatId = (targetRecipient || creds?.chatId || '').trim();
+      if (!botToken || !chatId) return res.status(400).json({ ok: false, error: 'Telegram Bot Token and Chat ID required' });
+      
+      const tgResp = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: chatId,
+          text: `📞 <b>INCOMING VOICE CALL FROM HANA AI</b>\n\n<i>"${message}"</i>\n\n🎙️ <a href="${liveCallRoomUrl}">Answer Live Voice Call</a>`,
+          parse_mode: 'HTML',
+        }),
+      });
+      const tgData = await tgResp.json().catch(() => ({}));
+      if (!tgData?.ok) return res.status(400).json({ ok: false, error: tgData?.description || 'Telegram dispatch failed' });
+
+      // Synthesize and send voice note to telegram receiver
+      try {
+        const voiceBuf = await synthesizeHanaVoice(message);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append('chat_id', chatId);
+          form.append('voice', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_greeting.wav');
+          form.append('caption', `📞 <b>Hana Call Greeting:</b> "${message}"`.slice(0, 1024));
+          form.append('parse_mode', 'HTML');
+          await fetch(`https://api.telegram.org/bot${botToken}/sendVoice`, {
+            method: 'POST',
+            body: form,
+          });
+        }
+      } catch {}
+
+      return res.json({ ok: true, dispatchId, platform: 'telegram', to: chatId, message, timestamp: dispatchTime });
+    }
+
+    if (platform === 'discord') {
+      const botToken = (creds?.botToken || '').trim().replace(/^Bot\s+/i, '');
+      const channelId = (creds?.channelId || targetRecipient || '').trim();
+      const targetUserId = (creds?.targetUserId || '').trim();
+
+      if (!botToken || !channelId) {
+        return res.status(400).json({
+          ok: false,
+          error: 'Discord Bot Token and target Channel ID are required',
+        });
+      }
+
+      const mention = targetUserId ? `<@${targetUserId}> ` : '';
+      let discData = {};
+      try {
+        const voiceBuf = await synthesizeHanaVoice(message);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append(
+            'payload_json',
+            JSON.stringify({
+              content: `${mention}📞 **Incoming Live Voice Call from Hana AI!**\n> "${message}"\n🎙️ **Live Call Room:** [Join Call](${liveCallRoomUrl})`,
+              attachments: [{ id: 0, filename: 'hana_call_greeting.wav', description: 'Hana AI Spoken Voice Greeting' }],
+            })
+          );
+          form.append('files[0]', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_call_greeting.wav');
+          const discResp = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${botToken}` },
+            body: form,
+          });
+          discData = await discResp.json().catch(() => ({}));
+          if (!discResp.ok) {
+            return res.status(discResp.status).json({
+              ok: false,
+              error: discData?.message || 'Discord message dispatch failed. Ensure bot has Send Messages and Attach Files permissions in the channel.',
+            });
+          }
+        } else {
+          const discResp = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages`, {
+            method: 'POST',
+            headers: {
+              Authorization: `Bot ${botToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              content: `${mention}📞 **Incoming Live Call from Hana AI Voice Switchboard!**\n> "${message}"\n🎙️ **Answer Call:** ${liveCallRoomUrl}`,
+            }),
+          });
+          discData = await discResp.json().catch(() => ({}));
+          if (!discResp.ok) {
+            return res.status(discResp.status).json({
+              ok: false,
+              error: discData?.message || 'Discord message dispatch failed.',
+            });
+          }
+        }
+      } catch (err) {
+        return res.status(500).json({ ok: false, error: err?.message || 'Discord dispatch error' });
+      }
+
+      return res.json({
+        ok: true,
+        dispatchId,
+        platform: 'discord',
+        to: channelId,
+        message,
+        timestamp: dispatchTime,
+        remoteMessageId: discData?.id,
+        callMode: 'voice_bridge',
+        liveCallUrl: liveCallRoomUrl,
+      });
+    }
+
+    if (platform === 'messenger') {
+      const pageToken = (creds?.pageAccessToken || '').trim();
+      const recipientId = (targetRecipient || creds?.recipientId || '').trim();
+      if (!pageToken || !recipientId) return res.status(400).json({ ok: false, error: 'Page Access Token and recipient ID required' });
+      const fbResp = await fetch(`https://graph.facebook.com/v21.0/me/messages?access_token=${pageToken}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ recipient: { id: recipientId }, message: { text: `📞 [Hana AI Live Voice Call Session]\n\n"${message}"\n\n🎙️ Answer Live: ${liveCallRoomUrl}` } }),
+      });
+      const fbData = await fbResp.json().catch(() => ({}));
+      if (!fbResp.ok) return res.status(fbResp.status).json({ ok: false, error: fbData?.error?.message || 'Messenger dispatch failed' });
+      return res.json({ ok: true, dispatchId, platform: 'messenger', to: recipientId, message, timestamp: dispatchTime });
+    }
+
+    return res.status(400).json({ ok: false, error: `Unsupported platform "${platform}"` });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err?.message || 'Dispatch failed' });
+  }
+});
+
+router.post('/caller/platforms/relay-reply', async (req, res) => {
+  try {
+    const { platform, target, botToken, text } = req.body || {};
+    if (!platform || !target || !text) {
+      return res.status(400).json({ ok: false, error: 'Platform, target, and text are required' });
+    }
+
+    if (platform === 'telegram') {
+      const cleanToken = String(botToken || '').trim().replace(/^bot/i, '');
+      if (!cleanToken) return res.status(400).json({ ok: false, error: 'Telegram Bot Token required' });
+
+      let voiceSent = false;
+      try {
+        const voiceBuf = await synthesizeHanaVoice(text);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append('chat_id', target);
+          form.append('voice', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_reply.wav');
+          form.append('caption', `🌸 <b>Hana:</b> ${text}`.slice(0, 1024));
+          form.append('parse_mode', 'HTML');
+          const tgVoiceResp = await fetch(`https://api.telegram.org/bot${cleanToken}/sendVoice`, {
+            method: 'POST',
+            body: form,
+          });
+          const tgVoiceData = await tgVoiceResp.json().catch(() => ({}));
+          if (tgVoiceData?.ok) voiceSent = true;
+        }
+      } catch {}
+
+      if (!voiceSent) {
+        await fetch(`https://api.telegram.org/bot${cleanToken}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: target, text: `🌸 <b>Hana:</b> ${text}`, parse_mode: 'HTML' }),
+        });
+      }
+      return res.json({ ok: true, voiceSent });
+    }
+
+    if (platform === 'discord') {
+      const cleanToken = String(botToken || '').trim().replace(/^Bot\s+/i, '');
+      if (!cleanToken) return res.status(400).json({ ok: false, error: 'Discord Bot Token required' });
+
+      let voiceSent = false;
+      try {
+        const voiceBuf = await synthesizeHanaVoice(text);
+        if (voiceBuf) {
+          const form = new FormData();
+          form.append(
+            'payload_json',
+            JSON.stringify({
+              content: `🌸 **Hana:** ${text}`.slice(0, 2000),
+              attachments: [{ id: 0, filename: 'hana_voice_reply.wav', description: 'Hana Spoken Voice Reply' }],
+            })
+          );
+          form.append('files[0]', new Blob([new Uint8Array(voiceBuf)], { type: 'audio/wav' }), 'hana_voice_reply.wav');
+          const discResp = await fetch(`https://discord.com/api/v10/channels/${target}/messages`, {
+            method: 'POST',
+            headers: { Authorization: `Bot ${cleanToken}` },
+            body: form,
+          });
+          if (discResp.ok) voiceSent = true;
+        }
+      } catch {}
+
+      if (!voiceSent) {
+        await fetch(`https://discord.com/api/v10/channels/${target}/messages`, {
+          method: 'POST',
+          headers: {
+            Authorization: `Bot ${cleanToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ content: `🌸 **Hana:** ${text}`.slice(0, 2000) }),
+        });
+      }
+      return res.json({ ok: true, voiceSent });
+    }
+
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: 'Relay failed' });
+  }
+});
+
+router.post('/caller/platforms/keep-bot-online', (req, res) => {
+  return res.json({ ok: true, platform: 'discord', status: 'online' });
+});
+
+router.get('/caller/platforms/poll', async (req, res) => {
+  try {
+    const target = String(req.query.target || '').trim();
+    const messagesToReturn = [];
+    const queue = omnichannelCallMessages.get(target);
+    if (queue && queue.length > 0) {
+      messagesToReturn.push(...queue);
+      omnichannelCallMessages.set(target, []);
+    }
+    return res.json({ ok: true, messages: messagesToReturn });
+  } catch {
+    return res.json({ ok: true, messages: [] });
+  }
+});
+
+router.get('/caller/webhooks/:platform', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && challenge) {
+    return res.status(200).send(challenge);
+  }
+  return res.json({ ok: true, status: 'listening', platform: req.params.platform });
+});
+
+router.post('/caller/webhooks/:platform', (req, res) => {
+  return res.json({ ok: true, received: true, platform: req.params.platform });
+});
+
+// ----------------------------------------------------
+// Discord Bot Gateway / REST API Proxy (Serverless Parity)
+// ----------------------------------------------------
+router.post('/discord/test', async (req, res) => {
+  try {
+    const { botToken } = req.body || {};
+    const token = (botToken || '').trim();
+    if (!token) {
+      return res.status(400).json({ ok: false, message: 'Bot token cannot be empty.' });
+    }
+
+    const discordResp = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (discordResp.ok) {
+      const data = await discordResp.json();
+      return res.json({
+        ok: true,
+        message: `Connected successfully as @${data.username}#${data.discriminator || '0'} (ID: ${data.id})`,
+        details: data,
+      });
+    } else {
+      const err = await discordResp.json().catch(() => ({}));
+      return res.status(discordResp.status).json({
+        ok: false,
+        message: err.message || `Discord API error: ${discordResp.status} ${discordResp.statusText}`,
+      });
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Network error communicating with Discord';
+    return res.status(500).json({ ok: false, message: msg });
+  }
+});
+
+router.post('/discord/send', async (req, res) => {
+  try {
+    const { botToken, channelId, content, replyToMessageId } = req.body || {};
+    const token = (botToken || '').trim();
+    const chId = (channelId || '').trim();
+    const text = (content || '').trim();
+
+    if (!token || !chId || !text) {
+      return res.status(400).json({ ok: false, error: 'Missing botToken, channelId, or content' });
+    }
+
+    const payload = { content: text };
+    if (replyToMessageId) {
+      payload.message_reference = { message_id: replyToMessageId };
+    }
+
+    const discordResp = await fetch(`https://discord.com/api/v10/channels/${chId}/messages`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await discordResp.json().catch(() => ({}));
+    if (discordResp.ok) {
+      return res.json({ ok: true, data });
+    } else {
+      return res.status(discordResp.status).json({ ok: false, error: data.message || 'Failed to send message' });
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Error sending message to Discord';
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+router.post('/discord/typing', async (req, res) => {
+  try {
+    const { botToken, channelId } = req.body || {};
+    const token = (botToken || '').trim();
+    const chId = (channelId || '').trim();
+    if (!token || !chId) {
+      return res.status(400).json({ ok: false, error: 'Missing botToken or channelId' });
+    }
+
+    await fetch(`https://discord.com/api/v10/channels/${chId}/typing`, {
+      method: 'POST',
+      headers: { Authorization: `Bot ${token}` },
+    });
+    return res.json({ ok: true });
+  } catch {
+    return res.status(500).json({ ok: false });
+  }
+});
+
+router.post('/discord/register-commands', async (req, res) => {
+  try {
+    const { botToken, applicationId, guildId } = req.body || {};
+    const token = (botToken || '').trim();
+    const appId = (applicationId || '').trim();
+    if (!token || !appId) {
+      return res.status(400).json({ ok: false, error: 'Missing botToken or applicationId' });
+    }
+
+    const commands = [
+      {
+        name: 'msg',
+        description: 'Send a prompt or query to Hana AI',
+        options: [
+          {
+            name: 'prompt',
+            description: 'Your prompt or question for Hana',
+            type: 3,
+            required: true,
+          },
+        ],
+      },
+      {
+        name: 'hana',
+        description: 'Chat with Hana AI companion',
+        options: [
+          {
+            name: 'prompt',
+            description: 'Your prompt or question for Hana',
+            type: 3,
+            required: true,
+          },
+        ],
+      },
+      {
+        name: 'ask',
+        description: 'Ask Hana AI a question',
+        options: [
+          {
+            name: 'question',
+            description: 'Your question',
+            type: 3,
+            required: true,
+          },
+        ],
+      },
+      {
+        name: 'help',
+        description: 'Display Hana AI bot command guide',
+      },
+      {
+        name: 'ping',
+        description: 'Check if Hana AI Discord bot is online and responding',
+      },
+      {
+        name: 'status',
+        description: 'View current Hana AI bot and engine status',
+      },
+    ];
+
+    const endpoint = guildId
+      ? `https://discord.com/api/v10/applications/${appId}/guilds/${guildId}/commands`
+      : `https://discord.com/api/v10/applications/${appId}/commands`;
+
+    const discordResp = await fetch(endpoint, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bot ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(commands),
+    });
+
+    const data = await discordResp.json().catch(() => ({}));
+    if (discordResp.ok) {
+      return res.json({ ok: true, commands: data });
+    } else {
+      return res.status(discordResp.status).json({ ok: false, error: data });
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Error registering slash commands';
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+// Cloud streaming endpoint for Gemini chat (/api/chat)
+router.post('/chat', async (req, res) => {
+  try {
+    const { messages, systemPrompt, maxTokens } = req.body || {};
+    const apiKey = process.env.GEMINI_API_KEY;
+
+    if (!apiKey) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY not configured on server' });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const formattedContents = (messages || []).map((msg) => ({
+      role: msg.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: msg.content }],
+    }));
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const outputTokens = Math.min(Math.max(Number(maxTokens) || 512, 64), 4096);
+    const candidateModels = [
+      'gemini-3.1-flash-lite',
+      'gemini-flash-latest',
+      'gemini-3.8-flash',
+    ];
+
+    let responseStream = null;
+    let lastError = null;
+
+    for (const cand of candidateModels) {
+      try {
+        responseStream = await ai.models.generateContentStream({
+          model: cand,
+          contents: formattedContents,
+          config: {
+            systemInstruction: systemPrompt || DEFAULT_SYSTEM_PROMPT,
+            temperature: 0.85,
+            maxOutputTokens: outputTokens,
+          },
+        });
+        if (responseStream) break;
+      } catch (streamErr) {
+        lastError = streamErr;
+      }
+    }
+
+    if (!responseStream) {
+      throw lastError || new Error('No available Gemini model responded');
+    }
+
+    for await (const chunk of responseStream) {
+      const text = chunk.text;
+      if (text) {
+        res.write(`data: ${JSON.stringify({ text })}\n\n`);
+      }
+    }
+
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    res.end();
+  } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : 'Unknown streaming error';
+    if (!res.headersSent) {
+      res.status(500).json({ error: errorMessage });
+    } else {
+      res.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+      res.end();
+    }
+  }
+});
+
+// =====================================================================
+// GRAPHQL SCHEMA & RESOLVERS FOR THIRD-PARTY CLIENTS
+// =====================================================================
+const graphqlSchema = buildSchema(`
+  type VRMModel {
+    url: String!
+    defaultOutfitId: String!
+    candidateUrls: [String!]!
+    activeFile: String!
+    outfits: [OutfitItem!]!
+  }
+
+  type OutfitItem {
+    id: String!
+    name: String!
+    fileName: String!
+    modelUrl: String!
+    fallbackModelUrl: String!
+    isPremium: Boolean!
+    isDefault: Boolean
+    isSecret: Boolean
+  }
+
+  type AnimationAsset {
+    type: String!
+    url: String!
+    candidateUrls: [String!]!
+    description: String!
+    loop: Boolean!
+  }
+
+  type EmotionDef {
+    name: String!
+    vrmMorph: String!
+    description: String!
+    valence: String!
+  }
+
+  type VisemeMapping {
+    phonemes: [String!]!
+    viseme: String!
+    vrmMouthMorph: String!
+  }
+
+  type VoiceEngineConfig {
+    lang: String!
+    rate: Float!
+    pitch: Float!
+    preferredVoices: [String!]!
+    visemes: [VisemeMapping!]!
+    acousticFilter: String!
+    maleKeywords: [String!]!
+    femaleKeywords: [String!]!
+  }
+
+  type LlmModelInfo {
+    id: String!
+    name: String!
+    tagline: String!
+    family: String!
+    description: String!
+    speedRating: String!
+    approxParams: String
+    sizeLabel: String
+    defaultDtype: String
+    hfRepo: String
+    isSmallModel: Boolean
+    inferenceType: String!
+    streamingEndpoint: String!
+  }
+
+  type PersonaProfile {
+    name: String!
+    alternateName: String
+    handle: String!
+    bio: String!
+    avatarUrl: String!
+    vrmModelUrl: String!
+    websiteUrl: String!
+    systemPromptAbridged: String!
+  }
+
+  type McpManifest {
+    name: String!
+    version: String!
+    protocolVersion: String!
+    tools: [String!]!
+    resources: [String!]!
+    prompts: [String!]!
+  }
+
+  type AvatarActionPayload {
+    type: String!
+    text: String!
+    emotion: String!
+    animation: String!
+    timestamp: Float!
+  }
+
+  type AvatarActionResult {
+    success: Boolean!
+    message: String!
+    activeSubscribers: Int!
+    event: AvatarActionPayload
+  }
+
+  type EmotionAnalysisResult {
+    text: String!
+    emotion: String!
+    method: String!
+  }
+
+  type PhonemeCue {
+    word: String!
+    viseme: String!
+    vrmMorph: String!
+    intensity: Float!
+  }
+
+  type PhonemeAnalysisResult {
+    text: String!
+    cues: [PhonemeCue!]!
+  }
+
+  type Query {
+    avatar(outfitId: String): VRMModel!
+    outfits: [OutfitItem!]!
+    animations(type: String): [AnimationAsset!]!
+    emotions: [EmotionDef!]!
+    voiceEngine: VoiceEngineConfig!
+    activeLlm(modelId: String): [LlmModelInfo!]!
+    persona: PersonaProfile!
+    mcpManifest: McpManifest!
+  }
+
+  type Mutation {
+    setAvatarAction(action: String, text: String, emotion: String, animation: String): AvatarActionResult!
+    detectEmotion(text: String!): EmotionAnalysisResult!
+    synthesizePhonemes(text: String!): PhonemeAnalysisResult!
+  }
+`);
+
+const WARDROBE_OUTFITS_LIST = [
+  { id: 'mint-maid-apron', name: 'Mint Maid Apron', fileName: 'hana_v1.3_vrm1.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_vrm1.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_vrm1.vrm`, isPremium: false, isDefault: true },
+  { id: 'candy-maid-apron', name: 'Candy Maid Apron', fileName: 'hana_v1.3_outfit2.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit2.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit2.vrm`, isPremium: false },
+  { id: 'imperial-noblewoman', name: 'Imperial Noblewoman', fileName: 'hana_v1.3_outfit3.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit3.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit3.vrm`, isPremium: true },
+  { id: 'lavender-grace-dress', name: 'Lavender Grace Dress', fileName: 'hana_v1.3_outfit4.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit4.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit4.vrm`, isPremium: true },
+  { id: 'sakura-spring', name: 'Sakura Spring', fileName: 'hana_v1.3_outfit5.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit5.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit5.vrm`, isPremium: false },
+  { id: 'school-uniform', name: 'School Uniform', fileName: 'hana_v1.3_outfit6.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit6.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit6.vrm`, isPremium: false },
+  { id: 'streetlit-hoodie', name: 'Streetlit Hoodie', fileName: 'hana_v1.3_outfit7.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit7.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit7.vrm`, isPremium: false },
+  { id: 'mux-future', name: 'Mux Future', fileName: 'hana_v1.3_outfit8.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit8.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit8.vrm`, isPremium: true },
+  { id: 'cozy-canadian-winter', name: 'Cozy Canadian Winter', fileName: 'hana_v1.3_outfit9.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit9.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit9.vrm`, isPremium: false },
+  { id: 'memorable-night', name: 'Memorable Night', fileName: 'hana_v1.3_outfit10.vrm', modelUrl: `${MODEL_SOURCE_DOMAIN}/hana_v1.3_outfit10.vrm`, fallbackModelUrl: `${MODEL_FALLBACK_DOMAIN}/hana_v1.3_outfit10.vrm`, isPremium: true },
+];
+
+const graphqlRoot = {
+  avatar: ({ outfitId }) => {
+    const outfit = outfitId ? WARDROBE_OUTFITS_LIST.find((o) => o.id === outfitId) : WARDROBE_OUTFITS_LIST[0];
+    const fileName = outfit?.fileName || 'hana_v1.3_vrm1.vrm';
+    return {
+      url: `/api/vrm?file=${encodeURIComponent(fileName)}`,
+      defaultOutfitId: 'mint-maid-apron',
+      candidateUrls: [
+        `/api/vrm?file=${encodeURIComponent(fileName)}`,
+        `${MODEL_SOURCE_DOMAIN}/${fileName}`,
+        `${MODEL_FALLBACK_DOMAIN}/${fileName}`,
+      ],
+      activeFile: fileName,
+      outfits: WARDROBE_OUTFITS_LIST,
+    };
+  },
+  outfits: () => WARDROBE_OUTFITS_LIST,
+  animations: ({ type }) => {
+    const list = [
+      { type: 'idle', url: '/api/animation/idle', candidateUrls: ['/api/animation/idle', `${MODEL_SOURCE_DOMAIN}/mixamo_idle.fbx`], description: 'Subtle breathing and natural idling loop', loop: true },
+      { type: 'walk', url: '/api/animation/walk', candidateUrls: ['/api/animation/walk', `${MODEL_SOURCE_DOMAIN}/mixamo_walk.fbx`], description: 'Forward walking step loop', loop: true },
+      { type: 'wave', url: '/api/animation/wave', candidateUrls: ['/api/animation/wave', `${MODEL_SOURCE_DOMAIN}/mixamo_wave.fbx`], description: 'Friendly right-hand greeting wave gesture', loop: false },
+      { type: 'fall', url: '/api/animation/fall', candidateUrls: ['/api/animation/fall', `${MODEL_SOURCE_DOMAIN}/mixamo_fall.fbx`], description: 'Tumble backwards onto floor impact physics', loop: false },
+      { type: 'getup', url: '/api/animation/getup', candidateUrls: ['/api/animation/getup', `${MODEL_SOURCE_DOMAIN}/mixamo_getup.fbx`], description: 'Recovery and standing back up animation', loop: false },
+      { type: 'yawn', url: '/api/animation/yawn', candidateUrls: ['/api/animation/yawn', `${MODEL_SOURCE_DOMAIN}/mixamo_yawn.fbx`], description: 'Drowsy yawn and subtle arm stretch sequence', loop: false },
+      { type: 'wait', url: '/api/animation/wait', candidateUrls: ['/api/animation/wait', `${MODEL_SOURCE_DOMAIN}/mixamo_wait.fbx`], description: 'Patient waiting posture', loop: false },
+      { type: 'jumpingjacks', url: '/api/animation/wait?file=mixamo_.jumpingjacks.fbx', candidateUrls: ['/api/animation/wait?file=mixamo_.jumpingjacks.fbx', `${MODEL_SOURCE_DOMAIN}/mixamo_jumpingjacks.fbx`], description: 'Energetic full-body jumping jacks exercise', loop: true },
+    ];
+    if (type) {
+      return list.filter((a) => a.type.toLowerCase() === type.toLowerCase());
+    }
+    return list;
+  },
+  emotions: () => [
+    { name: 'neutral', vrmMorph: 'neutral', description: 'Calm resting facial expression', valence: 'neutral' },
+    { name: 'happy', vrmMorph: 'happy', description: 'Warm tender smile, slight eye crinkle', valence: 'positive' },
+    { name: 'smug', vrmMorph: 'relaxed', description: 'Playful sly smirk, confident glance', valence: 'positive' },
+    { name: 'sad', vrmMorph: 'sad', description: 'Softly lowered eyelids, downcast gentle mouth', valence: 'negative' },
+    { name: 'angry', vrmMorph: 'angry', description: 'Slightly furrowed brow and cute pout', valence: 'negative' },
+    { name: 'surprised', vrmMorph: 'surprised', description: 'Wide ocular gaze and parted lips', valence: 'heightened' },
+  ],
+  voiceEngine: () => ({
+    lang: 'en-US',
+    rate: 1.05,
+    pitch: 1.25,
+    preferredVoices: ['Google UK English Female', 'Microsoft Zira', 'Samantha'],
+    visemes: [
+      { phonemes: ['a', 'ah', 'aa'], viseme: 'aa', vrmMouthMorph: 'aa' },
+      { phonemes: ['o', 'oh', 'aw'], viseme: 'oh', vrmMouthMorph: 'oh' },
+      { phonemes: ['u', 'oo', 'w', 'ou'], viseme: 'ou', vrmMouthMorph: 'ou' },
+      { phonemes: ['i', 'y', 'ih'], viseme: 'ih', vrmMouthMorph: 'ih' },
+      { phonemes: ['e', 'ee', 'ea'], viseme: 'ee', vrmMouthMorph: 'ee' },
+    ],
+    acousticFilter: 'Web Audio API BiquadFilter low-pass warm harmonic smoothing',
+    maleKeywords: ['david', 'george', 'mark', 'male'],
+    femaleKeywords: ['zira', 'samantha', 'victoria', 'female'],
+  }),
+  activeLlm: ({ modelId }) => {
+    const list = [
+      { id: 'smollm2-135m', name: 'Tiny Brain', tagline: '135M params', family: 'browser-slm', description: 'Runs 100% in browser', speedRating: 'Ultra-Fast', inferenceType: 'in-browser-onnx', streamingEndpoint: 'client-transformers-js' },
+      { id: 'llama-3.2-1b', name: 'Meta Brain', tagline: '1.2B params', family: 'browser-slm', description: 'Meta Llama 3.2 lightweight reasoning', speedRating: 'Fast', inferenceType: 'in-browser-onnx', streamingEndpoint: 'client-transformers-js' },
+      { id: 'gemini-api', name: 'Gemini API', tagline: 'Cloud model', family: 'cloud-api', description: 'Google Gemini 2.5 Flash', speedRating: 'Real-time', inferenceType: 'cloud-api', streamingEndpoint: '/api/chat' },
+      { id: 'muxai-ollama', name: 'MuxAI Brain', tagline: 'Self-hosted', family: 'ollama', description: 'Decentralized Ollama runner', speedRating: 'Fast', inferenceType: 'ollama-server', streamingEndpoint: '/api/ollama/chat' },
+    ];
+    if (modelId) {
+      return list.filter((m) => m.id === modelId);
+    }
+    return list;
+  },
+  persona: () => ({
+    name: 'Hana',
+    alternateName: 'Yana',
+    handle: '@hana_muxai',
+    bio: 'a flower so bright... her petals sparkled with light 🩵',
+    avatarUrl: DEFAULT_USER_AVATAR_URL,
+    vrmModelUrl: 'https://ai.mux8.com/hana_v1.3_vrm1.vrm',
+    websiteUrl: 'https://muxai.vercel.app',
+    systemPromptAbridged: DEFAULT_SYSTEM_PROMPT.slice(0, 300),
+  }),
+  mcpManifest: () => ({
+    name: 'ai-smash-mcp',
+    version: '1.0.0',
+    protocolVersion: '2024-11-05',
+    tools: ['avatar_act', 'avatar_say', 'avatar_emotion', 'avatar_animation', 'web_search', 'wikipedia', 'weather_info', 'location_info', 'device_info', 'ask_persona'],
+    resources: ['resource://persona/profile', 'resource://app/info'],
+    prompts: ['prompt://persona/chat'],
+  }),
+  setAvatarAction: ({ action, text, emotion, animation }) => {
+    return {
+      success: true,
+      message: 'Avatar action executed',
+      activeSubscribers: 1,
+      event: {
+        type: action || 'speak',
+        text: text || '',
+        emotion: emotion || 'happy',
+        animation: animation || 'wave',
+        timestamp: Date.now(),
+      },
+    };
+  },
+  detectEmotion: ({ text }) => {
+    const lower = (text || '').toLowerCase();
+    let emotion = 'neutral';
+    if (lower.includes('happy') || lower.includes('love') || lower.includes('great') || lower.includes('yay') || lower.includes('awesome')) emotion = 'happy';
+    else if (lower.includes('sad') || lower.includes('cry') || lower.includes('miss') || lower.includes('sorry')) emotion = 'sad';
+    else if (lower.includes('angry') || lower.includes('hate') || lower.includes('mad')) emotion = 'angry';
+    else if (lower.includes('wow') || lower.includes('omg') || lower.includes('whoa')) emotion = 'surprised';
+    return { text, emotion, method: 'sentiment-algorithm' };
+  },
+  synthesizePhonemes: ({ text }) => {
+    const words = (text || '').trim().split(/\s+/);
+    const cues = words.slice(0, 30).map((word) => {
+      const lower = word.toLowerCase();
+      let viseme = 'aa';
+      let morph = 'aa';
+      let intensity = 0.25;
+      if (/[ao]/.test(lower)) {
+        if (lower.includes('o') || lower.includes('aw')) { viseme = 'oh'; morph = 'oh'; intensity = 0.32; }
+        else { viseme = 'aa'; morph = 'aa'; intensity = 0.35; }
+      } else if (/[iuwy]/.test(lower)) {
+        if (lower.includes('u') || lower.includes('oo') || lower.includes('w')) { viseme = 'ou'; morph = 'ou'; intensity = 0.25; }
+        else { viseme = 'ih'; morph = 'ih'; intensity = 0.22; }
+      } else if (/[e]/.test(lower)) { viseme = 'ee'; morph = 'ee'; intensity = 0.25; }
+      return { word, viseme, vrmMorph: morph, intensity };
+    });
+    return { text, cues };
+  },
+};
+
+// GraphQL execution endpoint (POST /api/graphql)
+router.post('/graphql', async (req, res) => {
+  try {
+    const { query, variables, operationName } = req.body || {};
+    if (!query || typeof query !== 'string') {
+      return res.status(400).json({ errors: [{ message: 'GraphQL "query" string is required in request body.' }] });
+    }
+
+    const result = await graphql({
+      schema: graphqlSchema,
+      source: query,
+      rootValue: graphqlRoot,
+      variableValues: variables,
+      operationName,
+    });
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'GraphQL execution failure';
+    res.status(500).json({ errors: [{ message: msg }] });
+  }
+});
+
+// GraphQL GET endpoint
+router.get('/graphql', async (req, res) => {
+  try {
+    const rawQuery = typeof req.query.query === 'string' ? req.query.query : '';
+    if (rawQuery) {
+      let variables = undefined;
+      if (typeof req.query.variables === 'string') {
+        try { variables = JSON.parse(req.query.variables); } catch {}
+      }
+      const result = await graphql({
+        schema: graphqlSchema,
+        source: rawQuery,
+        rootValue: graphqlRoot,
+        variableValues: variables,
+      });
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      return res.json(result);
+    }
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.json({
+      status: 'ok',
+      endpoint: '/api/graphql',
+      description: 'Hana Universal 3D Avatar, Emotion, Voice & LLM GraphQL Endpoint',
+      sampleQuery: `{ avatar { url defaultOutfitId activeFile outfits { id name } } animations { type url loop } emotions { name vrmMorph } voiceEngine { lang rate pitch preferredVoices } activeLlm { id name family streamingEndpoint } }`,
+      docsUrl: '/docs/api/third-party-avatar',
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'GraphQL GET failure';
+    res.status(500).json({ errors: [{ message: msg }] });
+  }
+});
+
+// REST Built-in Tool Calling Endpoints
+router.get('/tools/web-search', async (req, res) => {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || '5'), 10), 1), 10);
+    if (!query) return res.json({ query: '', results: [], source: 'empty' });
+
+    const ddgUrl = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
+    const ddgResp = await fetch(ddgUrl);
+    const results = [];
+    if (ddgResp.ok) {
+      const data = await ddgResp.json().catch(() => ({}));
+      if (data.AbstractText) {
+        results.push({ title: data.Heading || query, snippet: data.AbstractText, url: data.AbstractURL || `https://duckduckgo.com/?q=${encodeURIComponent(query)}` });
+      }
+      if (Array.isArray(data.RelatedTopics)) {
+        for (const topic of data.RelatedTopics) {
+          if (topic.Text && topic.FirstURL) {
+            results.push({ title: topic.Text.split(' - ')[0] || query, snippet: topic.Text, url: topic.FirstURL });
+            if (results.length >= limit) break;
+          }
+        }
+      }
+    }
+    return res.json({ query, results: results.slice(0, limit), source: 'web_search_engine' });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, results: [] });
+  }
+});
+
+router.get('/tools/wikipedia', async (req, res) => {
+  try {
+    const query = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+    if (!query) return res.status(400).json({ error: 'Search query "q" parameter is required' });
+
+    const searchUrl = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&utf8=&format=json&origin=*`;
+    const searchRes = await fetch(searchUrl);
+    const searchData = await searchRes.json().catch(() => ({}));
+    const topHit = searchData.query?.search?.[0];
+    if (!topHit) return res.json({ found: false, title: query, extract: `No Wikipedia article found matching "${query}".`, url: 'https://en.wikipedia.org' });
+
+    const summaryUrl = `https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(topHit.title.replace(/\s+/g, '_'))}`;
+    const summaryRes = await fetch(summaryUrl);
+    if (summaryRes.ok) {
+      const data = await summaryRes.json();
+      return res.json({
+        found: true,
+        title: data.title || topHit.title,
+        description: data.description,
+        extract: data.extract || topHit.snippet,
+        url: data.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(topHit.title.replace(/\s+/g, '_'))}`,
+        thumbnail: data.thumbnail?.source,
+      });
+    }
+    return res.json({ found: true, title: topHit.title, extract: (topHit.snippet || '').replace(/<[^>]*>?/gm, ''), url: `https://en.wikipedia.org/wiki/${encodeURIComponent(topHit.title.replace(/\s+/g, '_'))}` });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/tools/weather', async (req, res) => {
+  try {
+    const city = typeof req.query.city === 'string' ? req.query.city.trim() : '';
+    let lat = req.query.lat ? parseFloat(String(req.query.lat)) : undefined;
+    let lon = req.query.lon ? parseFloat(String(req.query.lon)) : undefined;
+    let locationName = city || 'Custom Location';
+
+    if (city && (lat === undefined || lon === undefined)) {
+      const geoUrl = `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`;
+      const geoRes = await fetch(geoUrl);
+      if (geoRes.ok) {
+        const geoData = await geoRes.json();
+        if (Array.isArray(geoData.results) && geoData.results.length > 0) {
+          const hit = geoData.results[0];
+          lat = hit.latitude;
+          lon = hit.longitude;
+          locationName = `${hit.name}, ${hit.country || ''}`.replace(/,\s*$/, '');
+        }
+      }
+    }
+
+    if (lat === undefined || lon === undefined) {
+      lat = 35.6762;
+      lon = 139.6503;
+      locationName = 'Tokyo, Japan';
+    }
+
+    const forecastUrl = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&timezone=auto`;
+    const fRes = await fetch(forecastUrl);
+    if (!fRes.ok) return res.status(502).json({ error: 'Failed to fetch weather forecast' });
+    const data = await fRes.json();
+    return res.json({ location: locationName, latitude: lat, longitude: lon, current: data.current, daily: data.daily });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+router.get('/mcp', (_req, res) => {
+  return res.json({
+    status: 'ok',
+    name: 'ai-smash-mcp',
+    version: '1.0.0',
+    protocolVersion: '2024-11-05',
+    transport: 'sse',
+    sseEndpoint: '/api/mcp/sse',
+    messagesEndpoint: '/api/mcp/messages',
+    capabilities: {
+      tools: ['avatar_act', 'avatar_say', 'avatar_emotion', 'avatar_animation', 'web_search', 'wikipedia', 'weather_info', 'location_info', 'device_info', 'ask_persona'],
+      resources: ['resource://persona/profile', 'resource://app/info'],
+      prompts: ['prompt://persona/chat'],
+    },
+  });
 });
 
 apiApp.use('/api', router);

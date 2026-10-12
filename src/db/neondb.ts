@@ -48,6 +48,52 @@ function verifyPassword(password: string, storedHash: string): boolean {
   }
 }
 
+// ---------------------------------------------------------------------
+// In-Memory Active User Passwords & AES-256-GCM Message Encryption
+// Encrypts conversations and messages so NeonDB only stores encrypted data
+// ---------------------------------------------------------------------
+export const activeUserPasswords = new Map<number, string>();
+
+function deriveEncryptionKey(password: string, salt: Buffer): Buffer {
+  return crypto.scryptSync(password, salt, 32);
+}
+
+export function encryptWithPassword(plainText: string, password?: string): string {
+  if (!plainText || !password) return plainText;
+  if (plainText.startsWith('enc::')) return plainText; // avoid double-encryption
+  try {
+    const salt = crypto.randomBytes(16);
+    const iv = crypto.randomBytes(12);
+    const key = deriveEncryptionKey(password, salt);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+    const encrypted = Buffer.concat([cipher.update(plainText, 'utf8'), cipher.final()]);
+    const tag = cipher.getAuthTag();
+    return `enc::${salt.toString('hex')}:${iv.toString('hex')}:${tag.toString('hex')}:${encrypted.toString('hex')}`;
+  } catch (err) {
+    console.warn('Message encryption failed, keeping content:', err);
+    return plainText;
+  }
+}
+
+export function decryptWithPassword(cipherText: string, password?: string): string {
+  if (!cipherText || !cipherText.startsWith('enc::') || !password) return cipherText;
+  try {
+    const parts = cipherText.split(':');
+    if (parts.length < 6) return cipherText;
+    const salt = Buffer.from(parts[2], 'hex');
+    const iv = Buffer.from(parts[3], 'hex');
+    const tag = Buffer.from(parts[4], 'hex');
+    const encryptedData = Buffer.from(parts[5], 'hex');
+    const key = deriveEncryptionKey(password, salt);
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(encryptedData), decipher.final()]);
+    return decrypted.toString('utf8');
+  } catch {
+    return cipherText;
+  }
+}
+
 function sanitizeUser(u: InternalUserRecord | DbUserRecord): DbUserRecord {
   const rawAvatar = (u.avatar_url || '').trim();
   const normalizedAvatar =
@@ -213,6 +259,15 @@ CREATE TABLE IF NOT EXISTS redeem_codes (
 
 ALTER TABLE redeem_codes ADD COLUMN IF NOT EXISTS unlocked_outfit_ids TEXT[] NOT NULL DEFAULT '{}';
 
+CREATE TABLE IF NOT EXISTS user_redeemed_codes (
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  code TEXT NOT NULL,
+  redeemed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (user_id, code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_redeemed_codes_user ON user_redeemed_codes(user_id);
+
 INSERT INTO redeem_codes (code, account_type_grant, unlocked_outfit_ids, duration_days, max_uses)
 VALUES
   ('MUXAI-VIBE', 'paid', '{}', 365, 10000),
@@ -248,6 +303,44 @@ VALUES
   ], 3650, 100000)
 ON CONFLICT (code) DO UPDATE SET
   unlocked_outfit_ids = EXCLUDED.unlocked_outfit_ids;
+
+CREATE TABLE IF NOT EXISTS interviews (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  target_role TEXT NOT NULL,
+  company_name TEXT NOT NULL DEFAULT 'MuxAI',
+  description TEXT,
+  created_by_user_id INTEGER NULL REFERENCES users(id) ON DELETE SET NULL,
+  created_by_email TEXT,
+  config JSONB NOT NULL DEFAULT '{}',
+  questions JSONB NOT NULL DEFAULT '[]',
+  tasks JSONB NOT NULL DEFAULT '{}',
+  company_qa_knowledge JSONB NOT NULL DEFAULT '[]',
+  active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_interviews_created_by ON interviews(created_by_user_id);
+CREATE INDEX IF NOT EXISTS idx_interviews_active ON interviews(active);
+
+CREATE TABLE IF NOT EXISTS interview_submissions (
+  id TEXT PRIMARY KEY,
+  interview_id TEXT NOT NULL REFERENCES interviews(id) ON DELETE CASCADE,
+  candidate_name TEXT NOT NULL,
+  candidate_email TEXT,
+  status TEXT NOT NULL DEFAULT 'completed',
+  score INTEGER DEFAULT 85,
+  responses JSONB NOT NULL DEFAULT '[]',
+  snapshots JSONB NOT NULL DEFAULT '[]',
+  resume_data JSONB,
+  written_task TEXT,
+  pressure_rating TEXT,
+  ai_evaluation JSONB,
+  completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_interview_subs_interview_id ON interview_submissions(interview_id);
 `;
 
 async function ensureNeonSchema(): Promise<PoolType | null> {
@@ -278,6 +371,7 @@ async function ensureNeonSchema(): Promise<PoolType | null> {
 const fallbackUsers = new Map<string, InternalUserRecord>();
 const fallbackConversations = new Map<number, Conversation[]>();
 const fallbackCustomThemes = new Map<number, ThemeDefinition[]>();
+const fallbackRedeemedByUser = new Map<number, Set<string>>();
 const validPaidRedeemCodes = new Set<string>([
   'MUXAI-PREMIUM-2026',
   'HANA-VIP',
@@ -342,6 +436,7 @@ export async function signUpAccount(params: {
       );
 
       const user = sanitizeUser(insertRes.rows[0]);
+      activeUserPasswords.set(user.id, params.password);
       return { user, conversations: [], customThemes: [] };
     } catch (err: any) {
       if (err.message && err.message.includes('already exists')) {
@@ -377,6 +472,7 @@ export async function signUpAccount(params: {
   fallbackUsers.set(cleanEmail, newUser);
   fallbackConversations.set(newUser.id, []);
   fallbackCustomThemes.set(newUser.id, []);
+  activeUserPasswords.set(newUser.id, params.password);
 
   return {
     user: sanitizeUser(newUser),
@@ -425,7 +521,8 @@ export async function signInAccount(params: {
     );
 
     const user = sanitizeUser(updateRes.rows[0]);
-    const userData = await fetchUserSyncedData(user.id);
+    activeUserPasswords.set(user.id, params.password);
+    const userData = await fetchUserSyncedData(user.id, params.password);
     return {
       user,
       conversations: userData.conversations,
@@ -445,9 +542,20 @@ export async function signInAccount(params: {
     stored.device_fingerprints.push(params.fingerprint);
   }
 
+  activeUserPasswords.set(stored.id, params.password);
+  const rawConvs = fallbackConversations.get(stored.id) || [];
+  const decryptedConvs: Conversation[] = rawConvs.map((conv) => ({
+    ...conv,
+    title: decryptWithPassword(conv.title, params.password),
+    messages: (conv.messages || []).map((m) => ({
+      ...m,
+      content: decryptWithPassword(m.content, params.password),
+    })),
+  }));
+
   return {
     user: sanitizeUser(stored),
-    conversations: fallbackConversations.get(stored.id) || [],
+    conversations: decryptedConvs,
     customThemes: fallbackCustomThemes.get(stored.id) || [],
   };
 }
@@ -541,6 +649,14 @@ export async function redeemAccountCode(params: {
   const pool = await ensureNeonSchema();
 
   if (pool) {
+    const alreadyRedeemedRes = await pool.query(
+      'SELECT 1 FROM user_redeemed_codes WHERE user_id = $1 AND UPPER(code) = $2',
+      [params.userId, cleanCode]
+    );
+    if (alreadyRedeemedRes.rows.length > 0) {
+      throw new Error('You have already applied this redeem code.');
+    }
+
     const codeRes = await pool.query('SELECT * FROM redeem_codes WHERE UPPER(code) = $1', [cleanCode]);
     const hasDbRow = codeRes.rows.length > 0;
 
@@ -553,6 +669,10 @@ export async function redeemAccountCode(params: {
 
     if (hasDbRow) {
       const codeRow = codeRes.rows[0];
+      if (Array.isArray(codeRow.redeemed_by) && codeRow.redeemed_by.includes(params.userId)) {
+        throw new Error('You have already applied this redeem code.');
+      }
+
       if (Number(codeRow.used_count) >= Number(codeRow.max_uses)) {
         throw new Error('This redeem code has reached its usage limit.');
       }
@@ -581,6 +701,11 @@ export async function redeemAccountCode(params: {
       );
     }
 
+    await pool.query(
+      `INSERT INTO user_redeemed_codes (user_id, code) VALUES ($1, $2) ON CONFLICT (user_id, code) DO NOTHING`,
+      [params.userId, cleanCode]
+    );
+
     const existingUserRes = await pool.query('SELECT * FROM users WHERE id = $1', [params.userId]);
     if (existingUserRes.rows.length === 0) {
       throw new Error('User account not found.');
@@ -607,6 +732,11 @@ export async function redeemAccountCode(params: {
   }
 
   // Fallback verification when NeonDB is not configured
+  const userRedeemed = fallbackRedeemedByUser.get(params.userId);
+  if (userRedeemed && userRedeemed.has(cleanCode)) {
+    throw new Error('You have already applied this redeem code.');
+  }
+
   if (!isBuiltInPaidCode && matchedSecretIds.length === 0) {
     throw new Error('Invalid or expired redeem code.');
   }
@@ -621,6 +751,10 @@ export async function redeemAccountCode(params: {
         const curUnlocked = Array.isArray(u.unlocked_outfits) ? u.unlocked_outfits : [];
         u.unlocked_outfits = Array.from(new Set([...curUnlocked, ...matchedSecretIds]));
       }
+      if (!fallbackRedeemedByUser.has(params.userId)) {
+        fallbackRedeemedByUser.set(params.userId, new Set());
+      }
+      fallbackRedeemedByUser.get(params.userId)!.add(cleanCode);
       return sanitizeUser(u);
     }
   }
@@ -628,11 +762,12 @@ export async function redeemAccountCode(params: {
   throw new Error('User account not found.');
 }
 
-export async function fetchUserSyncedData(userId: number): Promise<{
+export async function fetchUserSyncedData(userId: number, password?: string): Promise<{
   conversations: Conversation[];
   customThemes: ThemeDefinition[];
   unlockedOutfits: string[];
 }> {
+  const effectivePassword = password || activeUserPasswords.get(userId);
   const pool = await ensureNeonSchema();
   if (pool) {
     const userRes = await pool.query('SELECT unlocked_outfits FROM users WHERE id = $1', [userId]);
@@ -652,10 +787,13 @@ export async function fetchUserSyncedData(userId: number): Promise<{
     const msgsByConv = new Map<string, Conversation['messages']>();
     for (const m of msgRes.rows) {
       const list = msgsByConv.get(m.conversation_id) || [];
+      const decryptedContent = effectivePassword
+        ? decryptWithPassword(m.content, effectivePassword)
+        : m.content;
       list.push({
         id: m.id,
         role: m.role,
-        content: m.content,
+        content: decryptedContent,
         timestamp: Number(m.timestamp),
         modelUsed: m.model_used || undefined,
         tokensCount: m.tokens_count ? Number(m.tokens_count) : undefined,
@@ -668,7 +806,7 @@ export async function fetchUserSyncedData(userId: number): Promise<{
 
     const conversations: Conversation[] = convRes.rows.map((c) => ({
       id: c.id,
-      title: c.title,
+      title: effectivePassword ? decryptWithPassword(c.title, effectivePassword) : c.title,
       createdAt: Number(c.created_at),
       updatedAt: Number(c.updated_at),
       pinned: Boolean(c.pinned),
@@ -701,8 +839,18 @@ export async function fetchUserSyncedData(userId: number): Promise<{
     }
   }
 
+  const rawConvs = fallbackConversations.get(userId) || [];
+  const decryptedConvs: Conversation[] = rawConvs.map((conv) => ({
+    ...conv,
+    title: effectivePassword ? decryptWithPassword(conv.title, effectivePassword) : conv.title,
+    messages: (conv.messages || []).map((m) => ({
+      ...m,
+      content: effectivePassword ? decryptWithPassword(m.content, effectivePassword) : m.content,
+    })),
+  }));
+
   return {
-    conversations: fallbackConversations.get(userId) || [],
+    conversations: decryptedConvs,
     customThemes: fallbackCustomThemes.get(userId) || [],
     unlockedOutfits: fallbackUnlocked,
   };
@@ -713,7 +861,9 @@ export async function syncUserConversationsAndThemes(params: {
   conversations?: Conversation[];
   customThemes?: ThemeDefinition[];
   unlockedOutfits?: string[];
+  password?: string;
 }): Promise<void> {
+  const effectivePassword = params.password || activeUserPasswords.get(params.userId);
   const pool = await ensureNeonSchema();
   if (pool) {
     const client = await pool.connect();
@@ -738,6 +888,10 @@ export async function syncUserConversationsAndThemes(params: {
 
       if (Array.isArray(params.conversations)) {
         for (const conv of params.conversations) {
+          const encTitle = effectivePassword
+            ? encryptWithPassword(conv.title || 'Direct Message', effectivePassword)
+            : conv.title || 'Direct Message';
+
           await client.query(
             `INSERT INTO conversations (id, user_id, title, model_id, pinned, created_at, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -749,7 +903,7 @@ export async function syncUserConversationsAndThemes(params: {
             [
               conv.id,
               params.userId,
-              conv.title || 'Direct Message',
+              encTitle,
               conv.modelId || 'smollm2-135m',
               Boolean(conv.pinned),
               Number(conv.createdAt) || Date.now(),
@@ -758,6 +912,10 @@ export async function syncUserConversationsAndThemes(params: {
           );
 
           for (const msg of conv.messages || []) {
+            const encContent = effectivePassword
+              ? encryptWithPassword(msg.content, effectivePassword)
+              : msg.content;
+
             await client.query(
               `INSERT INTO messages (
                 id, conversation_id, user_id, role, content, timestamp,
@@ -771,7 +929,7 @@ export async function syncUserConversationsAndThemes(params: {
                 conv.id,
                 params.userId,
                 msg.role,
-                msg.content,
+                encContent,
                 Number(msg.timestamp) || Date.now(),
                 msg.modelUsed || null,
                 msg.tokensCount ?? null,
@@ -828,9 +986,399 @@ export async function syncUserConversationsAndThemes(params: {
     }
   }
   if (Array.isArray(params.conversations)) {
-    fallbackConversations.set(params.userId, params.conversations);
+    const encConvs = effectivePassword
+      ? params.conversations.map((c) => ({
+          ...c,
+          title: encryptWithPassword(c.title || 'Direct Message', effectivePassword),
+          messages: (c.messages || []).map((m) => ({
+            ...m,
+            content: encryptWithPassword(m.content, effectivePassword),
+          })),
+        }))
+      : params.conversations;
+    fallbackConversations.set(params.userId, encConvs);
   }
   if (Array.isArray(params.customThemes)) {
     fallbackCustomThemes.set(params.userId, params.customThemes);
   }
 }
+
+// =====================================================================
+// AUTONOMOUS AI INTERVIEWS & RECRUITING SUITE (NeonDB Persistence)
+// =====================================================================
+
+export interface InterviewRecord {
+  id: string;
+  title: string;
+  target_role: string;
+  company_name: string;
+  description: string;
+  created_by_user_id?: number | null;
+  created_by_email?: string | null;
+  config: {
+    openQuestionSilenceSeconds?: number;
+    qaSilenceSeconds?: number;
+    activeSilenceVoiceline?: string;
+    showHana3DModel?: boolean;
+    recruiterPersonaName?: string;
+  };
+  questions: Array<{
+    id: string;
+    phase: string;
+    prompt: string;
+    description?: string;
+  }>;
+  tasks: {
+    requireResumeUpload?: boolean;
+    requireWrittenReflection?: boolean;
+    writtenPrompt?: string;
+    minWrittenChars?: number;
+    requirePressureRating?: boolean;
+    requireSnapshotCheck?: boolean;
+  };
+  company_qa_knowledge?: Array<{
+    title: string;
+    keywords: string[];
+    content: string;
+  }>;
+  active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface InterviewSubmissionRecord {
+  id: string;
+  interview_id: string;
+  candidate_name: string;
+  candidate_email?: string;
+  status: 'completed' | 'in_progress' | 'reviewed';
+  score: number;
+  responses: Array<{
+    phase: string;
+    question: string;
+    answer: string;
+    timestamp: string;
+  }>;
+  snapshots: Array<{
+    id: string;
+    angle: string;
+    label: string;
+    dataUrl: string;
+    timestamp: string;
+  }>;
+  resume_data?: {
+    fileName: string;
+    fileSize: string;
+    uploadedAt: string;
+  } | null;
+  written_task?: string;
+  pressure_rating?: string;
+  ai_evaluation?: {
+    strengths: string[];
+    areas_for_growth: string[];
+    summary: string;
+    recommendation: 'Strong Hire' | 'Hire' | 'Borderline' | 'Reject';
+  };
+  completed_at: string;
+}
+
+export const DEFAULT_DEMO_INTERVIEW: InterviewRecord = {
+  id: 'demo',
+  title: 'Senior Full Stack & AI Systems Engineer',
+  target_role: 'Senior Full Stack & AI Systems Engineer',
+  company_name: 'MuxAI',
+  description: 'Autonomous technical screening with Hana covering core engineering background, complex architecture, written reflection, situational performance, and interactive Q&A.',
+  created_by_user_id: null,
+  created_by_email: 'recruiting@muxai.com',
+  config: {
+    openQuestionSilenceSeconds: 3.0,
+    qaSilenceSeconds: 5.0,
+    activeSilenceVoiceline: "I am assuming you have nothing else to say for now so let's move on to the next step.",
+    showHana3DModel: true,
+    recruiterPersonaName: 'Hana',
+  },
+  questions: [
+    {
+      id: 'q1',
+      phase: 'question_1',
+      prompt: "Let's begin with a quick introduction. Could you tell me a bit about yourself, your background, and what drives your passion for this role?",
+      description: 'Introduction & Background',
+    },
+    {
+      id: 'q2',
+      phase: 'question_2',
+      prompt: "Thank you. Now, could you walk me through a challenging technical problem or project you tackled recently? How did you approach resolving it?",
+      description: 'Technical Problem Solving',
+    },
+  ],
+  tasks: {
+    requireResumeUpload: true,
+    requireWrittenReflection: true,
+    writtenPrompt: 'Please share three things you like about yourself and why. (Min 100 characters)',
+    minWrittenChars: 100,
+    requirePressureRating: true,
+    requireSnapshotCheck: true,
+  },
+  company_qa_knowledge: [],
+  active: true,
+  created_at: '2026-01-01T00:00:00.000Z',
+  updated_at: '2026-01-01T00:00:00.000Z',
+};
+
+export const fallbackInterviews = new Map<string, InterviewRecord>([
+  ['demo', DEFAULT_DEMO_INTERVIEW],
+]);
+export const fallbackInterviewSubmissions = new Map<string, InterviewSubmissionRecord[]>();
+
+export async function createInterviewInDb(interview: InterviewRecord): Promise<InterviewRecord> {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const res = await pool.query(
+        `INSERT INTO interviews (
+          id, title, target_role, company_name, description,
+          created_by_user_id, created_by_email, config, questions, tasks,
+          company_qa_knowledge, active, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW(), NOW())
+        ON CONFLICT (id) DO UPDATE SET
+          title = EXCLUDED.title,
+          target_role = EXCLUDED.target_role,
+          company_name = EXCLUDED.company_name,
+          description = EXCLUDED.description,
+          config = EXCLUDED.config,
+          questions = EXCLUDED.questions,
+          tasks = EXCLUDED.tasks,
+          company_qa_knowledge = EXCLUDED.company_qa_knowledge,
+          active = EXCLUDED.active,
+          updated_at = NOW()
+        RETURNING *`,
+        [
+          interview.id,
+          interview.title,
+          interview.target_role,
+          interview.company_name || 'MuxAI',
+          interview.description || '',
+          interview.created_by_user_id || null,
+          interview.created_by_email || null,
+          JSON.stringify(interview.config || {}),
+          JSON.stringify(interview.questions || []),
+          JSON.stringify(interview.tasks || {}),
+          JSON.stringify(interview.company_qa_knowledge || []),
+          interview.active !== false,
+        ]
+      );
+      if (res.rows[0]) {
+        const row = res.rows[0];
+        const record: InterviewRecord = {
+          id: row.id,
+          title: row.title,
+          target_role: row.target_role,
+          company_name: row.company_name,
+          description: row.description,
+          created_by_user_id: row.created_by_user_id,
+          created_by_email: row.created_by_email,
+          config: typeof row.config === 'string' ? JSON.parse(row.config) : row.config || {},
+          questions: typeof row.questions === 'string' ? JSON.parse(row.questions) : row.questions || [],
+          tasks: typeof row.tasks === 'string' ? JSON.parse(row.tasks) : row.tasks || {},
+          company_qa_knowledge: typeof row.company_qa_knowledge === 'string' ? JSON.parse(row.company_qa_knowledge) : row.company_qa_knowledge || [],
+          active: row.active,
+          created_at: new Date(row.created_at).toISOString(),
+          updated_at: new Date(row.updated_at).toISOString(),
+        };
+        fallbackInterviews.set(record.id, record);
+        return record;
+      }
+    } catch (err) {
+      console.warn('NeonDB createInterview error, using in-memory store:', err);
+    }
+  }
+
+  // Fallback in-memory
+  const record: InterviewRecord = {
+    ...interview,
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  fallbackInterviews.set(record.id, record);
+  return record;
+}
+
+export async function getInterviewByIdFromDb(id: string): Promise<InterviewRecord | null> {
+  const cleanId = String(id || '').trim();
+  if (!cleanId) return null;
+
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const res = await pool.query('SELECT * FROM interviews WHERE id = $1 LIMIT 1', [cleanId]);
+      if (res.rows[0]) {
+        const row = res.rows[0];
+        const record: InterviewRecord = {
+          id: row.id,
+          title: row.title,
+          target_role: row.target_role,
+          company_name: row.company_name,
+          description: row.description,
+          created_by_user_id: row.created_by_user_id,
+          created_by_email: row.created_by_email,
+          config: typeof row.config === 'string' ? JSON.parse(row.config) : row.config || {},
+          questions: typeof row.questions === 'string' ? JSON.parse(row.questions) : row.questions || [],
+          tasks: typeof row.tasks === 'string' ? JSON.parse(row.tasks) : row.tasks || {},
+          company_qa_knowledge: typeof row.company_qa_knowledge === 'string' ? JSON.parse(row.company_qa_knowledge) : row.company_qa_knowledge || [],
+          active: row.active,
+          created_at: new Date(row.created_at).toISOString(),
+          updated_at: new Date(row.updated_at).toISOString(),
+        };
+        fallbackInterviews.set(record.id, record);
+        return record;
+      }
+    } catch (err) {
+      console.warn('NeonDB getInterview error, checking in-memory store:', err);
+    }
+  }
+
+  return fallbackInterviews.get(cleanId) || (cleanId === 'demo' ? DEFAULT_DEMO_INTERVIEW : null);
+}
+
+export async function listInterviewsFromDb(userId?: number): Promise<InterviewRecord[]> {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const query = userId
+        ? 'SELECT * FROM interviews WHERE (created_by_user_id = $1 OR id = \'demo\') AND active = TRUE ORDER BY created_at DESC'
+        : 'SELECT * FROM interviews WHERE active = TRUE ORDER BY created_at DESC';
+      const params = userId ? [userId] : [];
+      const res = await pool.query(query, params);
+      if (res.rows.length > 0) {
+        return res.rows.map((row) => ({
+          id: row.id,
+          title: row.title,
+          target_role: row.target_role,
+          company_name: row.company_name,
+          description: row.description,
+          created_by_user_id: row.created_by_user_id,
+          created_by_email: row.created_by_email,
+          config: typeof row.config === 'string' ? JSON.parse(row.config) : row.config || {},
+          questions: typeof row.questions === 'string' ? JSON.parse(row.questions) : row.questions || [],
+          tasks: typeof row.tasks === 'string' ? JSON.parse(row.tasks) : row.tasks || {},
+          company_qa_knowledge: typeof row.company_qa_knowledge === 'string' ? JSON.parse(row.company_qa_knowledge) : row.company_qa_knowledge || [],
+          active: row.active,
+          created_at: new Date(row.created_at).toISOString(),
+          updated_at: new Date(row.updated_at).toISOString(),
+        }));
+      }
+    } catch (err) {
+      console.warn('NeonDB listInterviews error, using in-memory store:', err);
+    }
+  }
+
+  const items = Array.from(fallbackInterviews.values()).filter((i) => i.active);
+  if (!items.some((i) => i.id === 'demo')) {
+    items.unshift(DEFAULT_DEMO_INTERVIEW);
+  }
+  return items;
+}
+
+export async function deleteInterviewFromDb(id: string, userId?: number): Promise<boolean> {
+  const cleanId = String(id || '').trim();
+  if (!cleanId || cleanId === 'demo') return false; // Protect default demo template
+
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      if (userId) {
+        await pool.query('DELETE FROM interviews WHERE id = $1 AND created_by_user_id = $2', [cleanId, userId]);
+      } else {
+        await pool.query('DELETE FROM interviews WHERE id = $1', [cleanId]);
+      }
+    } catch (err) {
+      console.warn('NeonDB deleteInterview error:', err);
+    }
+  }
+
+  fallbackInterviews.delete(cleanId);
+  return true;
+}
+
+export async function submitInterviewSessionToDb(
+  submission: InterviewSubmissionRecord
+): Promise<InterviewSubmissionRecord> {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      await pool.query(
+        `INSERT INTO interview_submissions (
+          id, interview_id, candidate_name, candidate_email, status, score,
+          responses, snapshots, resume_data, written_task, pressure_rating,
+          ai_evaluation, completed_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+        ON CONFLICT (id) DO NOTHING`,
+        [
+          submission.id,
+          submission.interview_id,
+          submission.candidate_name,
+          submission.candidate_email || null,
+          submission.status || 'completed',
+          submission.score ?? 85,
+          JSON.stringify(submission.responses || []),
+          JSON.stringify(submission.snapshots || []),
+          submission.resume_data ? JSON.stringify(submission.resume_data) : null,
+          submission.written_task || '',
+          submission.pressure_rating || '',
+          submission.ai_evaluation ? JSON.stringify(submission.ai_evaluation) : null,
+        ]
+      );
+    } catch (err) {
+      console.warn('NeonDB submitInterviewSession error, using in-memory store:', err);
+    }
+  }
+
+  const list = fallbackInterviewSubmissions.get(submission.interview_id) || [];
+  list.unshift(submission);
+  fallbackInterviewSubmissions.set(submission.interview_id, list);
+  return submission;
+}
+
+export async function listInterviewSubmissionsFromDb(
+  interviewId?: string
+): Promise<InterviewSubmissionRecord[]> {
+  const pool = await ensureNeonSchema();
+  if (pool) {
+    try {
+      const query = interviewId
+        ? 'SELECT * FROM interview_submissions WHERE interview_id = $1 ORDER BY completed_at DESC LIMIT 50'
+        : 'SELECT * FROM interview_submissions ORDER BY completed_at DESC LIMIT 50';
+      const params = interviewId ? [interviewId] : [];
+      const res = await pool.query(query, params);
+      if (res.rows.length > 0) {
+        return res.rows.map((row) => ({
+          id: row.id,
+          interview_id: row.interview_id,
+          candidate_name: row.candidate_name,
+          candidate_email: row.candidate_email,
+          status: row.status,
+          score: Number(row.score) || 85,
+          responses: typeof row.responses === 'string' ? JSON.parse(row.responses) : row.responses || [],
+          snapshots: typeof row.snapshots === 'string' ? JSON.parse(row.snapshots) : row.snapshots || [],
+          resume_data: typeof row.resume_data === 'string' ? JSON.parse(row.resume_data) : row.resume_data,
+          written_task: row.written_task,
+          pressure_rating: row.pressure_rating,
+          ai_evaluation: typeof row.ai_evaluation === 'string' ? JSON.parse(row.ai_evaluation) : row.ai_evaluation,
+          completed_at: new Date(row.completed_at).toISOString(),
+        }));
+      }
+    } catch (err) {
+      console.warn('NeonDB listInterviewSubmissions error, using in-memory store:', err);
+    }
+  }
+
+  if (interviewId) {
+    return fallbackInterviewSubmissions.get(interviewId) || [];
+  }
+  const all: InterviewSubmissionRecord[] = [];
+  for (const list of fallbackInterviewSubmissions.values()) {
+    all.push(...list);
+  }
+  return all.sort((a, b) => Date.parse(b.completed_at) - Date.parse(a.completed_at));
+}
+
